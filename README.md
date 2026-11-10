@@ -1,19 +1,55 @@
 # VF Unity
 Streamlined version of AdaptiveFlow combining both AFVS and AFLP
 
-## Prerequisites
-Please clone the repository using: 
+## Running with the Drug Discovery Suite (recommended)
+
+> **Using the lab's Drug Discovery Suite?** Then there is nothing to install or clone. Run `ddsuite vs` from the
+> folder that holds your config file (see the suite's README for the one-time `ddsuite setup`).
+
+```bash
+ddsuite vs --example > config.txt     # write an annotated example config file, then edit it
+ddsuite vs config.txt --check         # check the config file and the receptor; runs nothing
+ddsuite vs config.txt                 # run; results go to ./vs_run
+ddsuite vs config.txt -o results/run1 # choose the run folder
 ```
-git clone git@github.com:QuantumAI4Bio/AdaptiveFlow-Unity.git
+
+The launcher (`vs_cli.py`) makes a new **run folder** for every run, so your own folder and the shared installation
+are never written to. The run folder holds:
+
+| In the run folder | What it is |
+|---|---|
+| `config.txt` | A copy of your config file, with `receptor=` pointing at the linked receptor |
+| `config/` | Links to this tool's helper files, plus a link to your receptor file |
+| `executables` | Link to the docking programs shipped with this tool |
+| `ligands/`, `outputs/` | Prepared 3D ligands and docked poses (written by the workflow) |
+| `docking_output.csv`, `rescoring_output.csv` | The result tables described below |
+
+- **`receptor=`** in your config can be an absolute path, or relative to the config file (or the current folder). Use a
+  receptor in the format the chosen docking program needs (PDBQT for the Vina family). The shipped example
+  `./config/5wiu_test.pdbqt` also works. Paths must not contain spaces.
+- An existing run folder is never overwritten unless you add `--force`, and then only if this launcher made it.
+- Docking programs that are not shipped here (Glide and CovDock need a Schrödinger licence, GOLD, FRED and others have
+  their own requirements) are listed in [Special Considerations](#special-considerations); the launcher warns when the
+  chosen program is not among the shipped ones.
+- The Python function-call examples below call `run_vf_unity.main` directly and must be run inside a folder laid out
+  like a run folder. The launcher does that for you.
+
+## Prerequisites (standalone use)
+The suite installs all of this. On its own, the tool needs [Pixi](https://pixi.sh/) (0.83.0 or newer):
 ```
-Please ensure that the following packages are installed: 
-- [RDKit version 2021.09.5](https://www.rdkit.org/docs/Install.html)
-- [Open Babel 3.1.0](https://openbabel.org/docs/dev/Installation/install.html)
-- [Python 3.7.13](https://www.python.org/downloads/)
-- [SELFIES](https://github.com/aspuru-guzik-group/selfies)
+git clone git@github.com:Chemical-Biology-STP/AdaptiveFlow-Unity.git
+cd AdaptiveFlow-Unity
+pixi install
+pixi run python vs_cli.py config.txt
+```
+This creates one environment with Python 3.11 or newer, RDKit, Open Babel, SELFIES and NumPy
+(see `pixi.toml`). The original code was written against RDKit 2021.09.5, Open Babel 3.1.0 and Python 3.7; it has been
+run with the versions in `pixi.lock` (QuickVina with and without NNScore2 re-scoring).
+Programs that are not Python packages (AmberTools, Chimera, dock6, licensed software) are not part of the environment.
 
 
 ## File Navigator
+* `vs_cli.py`: Launcher used by `ddsuite vs`. Builds a run folder and runs `run_vf_unity.py` inside it. 
 * `run_vf_unity.py`: Main file that initiates docking calculations. 
 * `initiate_calc.py`: File that initiates scoring and docking calculations. 
 * `lig_process.py`: Process provided ligand into 3D format compatible with docking program (used by )

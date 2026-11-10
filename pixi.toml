@@ -1,0 +1,15 @@
+[workspace]
+channels = ["conda-forge"]
+name = "virtual_screening"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+vs = "python vs_cli.py"
+
+[dependencies]
+python = ">=3.11"
+rdkit = ">=2026.9.2,<2027"
+numpy = ">=2.5.4,<3"
+selfies = ">=2.2.0,<3"
+openbabel = ">=3.2.1,<4"
