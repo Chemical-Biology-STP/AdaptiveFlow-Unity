@@ -77,8 +77,10 @@ class Settings:
     # molecules
     ligands: str = ""
     ligand_stage: str = ""          # the reduced molecule file, when some molecules were left out
-    library: list = field(default_factory=list)       # LigandResult
-    kept: list = field(default_factory=list)
+    library: object = None            # Library: what the check of the molecule file found
+    exclude: set = field(default_factory=set)          # indices of molecules left out of the job
+    n_kept: int = 0                   # molecules the job will dock
+    first_names: list = field(default_factory=list)    # names of the first few, for the review
     flagged_choice: object = None
     # docking
     program: str = vs_dock.DEFAULT_PROGRAM
@@ -105,9 +107,21 @@ class Settings:
 class LigandResult:
     index: int
     name: str
-    mol: object
     usable: bool
     problems: list = field(default_factory=list)
+
+
+@dataclass
+class Library:
+    """What the check of a molecule file found. It does not hold the molecules: a library may have millions."""
+    total: int = 0
+    bad: list = field(default_factory=list)          # LigandResult of molecules that cannot be docked
+    noted: list = field(default_factory=list)        # LigandResult of molecules that can be docked but need a note
+    first_names: list = field(default_factory=list)  # names of the first few molecules that can be docked
+
+    @property
+    def usable(self):
+        return self.total - len(self.bad)
 
 
 # --------------------------------------------------------------------------
@@ -527,8 +541,10 @@ def step_protonation(s, cfg, info, ref_xyz):
             prep = pp.protonate(text, ref_xyz, ph)
         except pp.ProteinPrepError as exc:
             if cfg is not None:
-                raise Stop(f"Protonation with PDB2PQR did not work: {exc}\n  Set 'protonation: adfr' to use ADFR's "
-                           "quicker hydrogen placement instead.")
+                raise Stop(f"Protonation with PDB2PQR did not work: {exc}\n"
+                           "  This happens with structures that have missing backbone atoms (3 of 13 deposited "
+                           "structures tried here). Set 'protonation: adfr' to use ADFR's quicker hydrogen placement "
+                           "instead, or repair the structure first and use 'receptor' with 'reference_ligand'.")
             warn(f"Protonation with PDB2PQR did not work: {exc}")
             note("Falling back to ADFR's quicker rule-based hydrogen placement.")
             choice = "adfr"
@@ -730,68 +746,67 @@ def step_site(s, cfg):
 
 
 def check_library(path, program):
-    """Read the ligand file and run the quick checks on every molecule. Returns a list of LigandResult.
+    """Read the molecule file one molecule at a time and run the quick checks. Returns a Library.
 
     Only cheap checks are made here (they must work for libraries of many thousands). Whether RDKit can generate 3D
     coordinates for a molecule is found out in the job, where a failure is reported for that molecule only.
     """
-    from rdkit import RDLogger
-
-    RDLogger.DisableLog("rdApp.*")
-    rows = vs_dock.read_ligands(path)
-    results = []
-    total = len(rows)
-    for i, (name, mol, error) in enumerate(rows):
-        if total > 500 and i % 200 == 0:
-            sys.stdout.write(f"\r  Checking molecule {i + 1} of {total}...   ")
+    total = vs_dock.count_ligands(path)
+    library = Library(total=0)
+    for index, name, mol, error in vs_dock.iter_ligands(path):
+        library.total += 1
+        if library.total > 500 and library.total % 500 == 0:
+            sys.stdout.write(f"\r  Checking molecule {library.total:,} of {total:,}...   ")
             sys.stdout.flush()
         if mol is None:
-            results.append(LigandResult(i, name, None, False, [error or "could not be read"]))
+            library.bad.append(LigandResult(index, name, False, [error or "could not be read"]))
             continue
         usable, problems = vs_dock.check_ligand(name, mol, program)
-        results.append(LigandResult(i, name, mol, usable, problems))
-    if total > 500:
-        sys.stdout.write("\r" + " " * 50 + "\r")
-    return results
+        if not usable:
+            library.bad.append(LigandResult(index, name, False, problems))
+            continue
+        if problems:
+            library.noted.append(LigandResult(index, name, True, problems))
+        if len(library.first_names) < 3:
+            library.first_names.append(name)
+    if library.total > 500:
+        sys.stdout.write("\r" + " " * 60 + "\r")
+    return library
 
 
-def flagged(results):
-    return [r for r in results if r.problems]
-
-
-def report_library(results, program, shown=12):
-    unusable = [r for r in results if not r.usable]
-    noted = [r for r in results if r.usable and r.problems]
-    ok(f"{len(results) - len(unusable)} of {len(results)} molecule(s) can be docked with "
-       f"{vs_dock.PROGRAMS[program]['title']}.")
+def report_library(library, program, shown=12):
+    unusable, noted = library.bad, library.noted
+    ok(f"{library.usable:,} of {library.total:,} molecule(s) can be docked with {vs_dock.PROGRAMS[program]['title']}.")
     if unusable:
-        say(f"\n  {yellow(str(len(unusable)) + ' molecule(s) cannot be docked:')}")
+        say(f"\n  {yellow(f'{len(unusable):,} molecule(s) cannot be docked:')}")
         table([(r.index + 1, r.name[:30], "; ".join(r.problems)[:90]) for r in unusable[:shown]],
               headers=("#", "Molecule", "Problem"))
         if len(unusable) > shown:
-            note(f"... and {len(unusable) - shown} more.")
+            note(f"... and {len(unusable) - shown:,} more.")
     if noted:
-        say(f"\n  {len(noted)} molecule(s) can be docked but need a note:")
+        say(f"\n  {len(noted):,} molecule(s) can be docked but need a note:")
         table([(r.index + 1, r.name[:30], "; ".join(r.problems)[:90]) for r in noted[:shown]],
               headers=("#", "Molecule", "Note"))
         if len(noted) > shown:
-            note(f"... and {len(noted) - shown} more.")
+            note(f"... and {len(noted) - shown:,} more.")
 
 
-def write_library(path, results):
-    """Write the given molecules to a file the job can read: SDF if the input was SDF, SMILES otherwise."""
+def write_library(path, source, exclude):
+    """Write `source` without the molecules whose index is in `exclude`, to a file the job can read (SDF if the input
+    was SDF, SMILES otherwise). Streams, so it works for any size."""
     from rdkit import Chem
 
     if path.lower().endswith(".sdf"):
         with Chem.SDWriter(path) as writer:
-            for r in results:
-                r.mol.SetProp("_Name", r.name)
-                writer.write(r.mol)
+            for index, name, mol, _ in vs_dock.iter_ligands(source):
+                if index not in exclude and mol is not None:
+                    mol.SetProp("_Name", name)
+                    writer.write(mol)
     else:
         with open(path, "w") as fh:
-            for r in results:
-                name = re.sub(r"\s+", "_", r.name)
-                fh.write(f"{Chem.MolToSmiles(r.mol)} {name}\n")
+            for index, name, mol, _ in vs_dock.iter_ligands(source):
+                if index not in exclude and mol is not None:
+                    fh.write(f"{Chem.MolToSmiles(mol)} {re.sub(chr(92) + 's+', '_', name)}\n")
 
 
 def step_ligands(s, cfg):
@@ -799,41 +814,41 @@ def step_ligands(s, cfg):
     if cfg is None:
         say("  A file with the molecules to dock: an SDF file, or a text file with one SMILES per line")
         say("  (\"SMILES name\", separated by a space, comma or tab; a header line is fine).")
-        say("  Any number of molecules works; the job docks several at the same time.\n")
+        say("  Any number works; the job docks several at the same time.\n")
         while True:
-            s.ligands = ask("Molecule file", validate=file_validator(vs_runfile.LIGAND_EXTENSIONS), completer=path_completer)
+            s.ligands = ask("Molecule file", validate=file_validator(vs_runfile.LIGAND_EXTENSIONS),
+                            completer=path_completer)
             say("")
-            results = check_library(s.ligands, s.program)
-            if not results:
+            library = check_library(s.ligands, s.program)
+            if library.total == 0:
                 fail("No molecules were found in that file. Choose another.")
                 continue
-            report_library(results, s.program)
-            if not [r for r in results if r.usable]:
+            report_library(library, s.program)
+            if library.usable == 0:
                 fail("None of these molecules can be docked. Choose another file.")
                 continue
             break
     else:
         s.ligands = cfg["ligands"]
-        results = check_library(s.ligands, s.program)
-        if not results:
+        library = check_library(s.ligands, s.program)
+        if library.total == 0:
             raise Stop(f"No molecules were found in {s.ligands}.")
-        report_library(results, s.program)
-        if not [r for r in results if r.usable]:
+        report_library(library, s.program)
+        if library.usable == 0:
             raise Stop("None of the molecules can be docked (see above).")
-    s.library = results
-    s.kept = [r for r in results if r.usable]
-    bad = [r for r in results if not r.usable]
+    s.library = library
+    s.exclude = set()
+    s.n_kept = library.total
+    s.first_names = library.first_names
+    bad = library.bad
     if bad:
-        remaining = [r for r in results if r.usable]
         if cfg is None:
             say("")
-            if ask_yes_no(f"Leave out the {len(bad)} molecule(s) that cannot be docked and dock the other "
-                          f"{len(remaining)}?", True):
+            if ask_yes_no(f"Leave out the {len(bad):,} molecule(s) that cannot be docked and dock the other "
+                          f"{library.usable:,}?", True):
                 s.flagged_choice = "exclude"
-                say(f"  {len(remaining)} molecule(s) will be docked.")
             else:
                 s.flagged_choice = "include"
-                s.kept = results
                 warn("Molecules that cannot be docked are included; the job reports each of them as failed, and "
                      "the others are still docked.")
         else:
@@ -841,30 +856,33 @@ def step_ligands(s, cfg):
             if choice is None:
                 lines = [f"    #{r.index + 1} {r.name[:40]}: {'; '.join(r.problems)}" for r in bad[:15]]
                 if len(bad) > 15:
-                    lines.append(f"    ... and {len(bad) - 15} more")
+                    lines.append(f"    ... and {len(bad) - 15:,} more")
                 raise Stop("'flagged_ligands' is missing.\n"
-                           f"  {len(bad)} of {len(results)} molecule(s) cannot be docked. The assistant asks whether to "
-                           "leave them out:\n" + "\n".join(lines) + "\n"
+                           f"  {len(bad):,} of {library.total:,} molecule(s) cannot be docked. The assistant asks "
+                           "whether to leave them out:\n" + "\n".join(lines) + "\n"
                            "    flagged_ligands: exclude    dock only the molecules that can be docked\n"
                            "    flagged_ligands: include    dock all of them; the ones that cannot be docked are "
                            "reported as failed, the others are still docked")
             s.flagged_choice = choice
             if choice == "include":
-                s.kept = results
                 warn("Molecules that cannot be docked are included; the job reports each of them as failed.")
-            else:
-                say(f"  {len(remaining)} molecule(s) will be docked ({len(bad)} left out).")
-    s.remaining = len(s.kept)
-    s.clean = len(s.kept) >= 500
-    if len(s.kept) > BIG_LIBRARY:
-        warn(f"{len(s.kept):,} molecules is a large library: the job writes a folder per molecule, so intermediate "
+        if s.flagged_choice == "exclude":
+            s.exclude = {r.index for r in bad}
+            s.n_kept = library.usable
+            say(f"  {library.usable:,} molecule(s) will be docked ({len(bad):,} left out).")
+        elif cfg is None:
+            say(f"  All {library.total:,} molecule(s) will be docked.")
+    s.remaining = s.n_kept
+    s.clean = s.n_kept >= 500
+    if s.n_kept > BIG_LIBRARY:
+        warn(f"{s.n_kept:,} molecules is a large library: the job writes a folder per molecule, so intermediate "
              "files are deleted as it goes, and a run may need several jobs (finished molecules are skipped when "
              "you resume).")
-    if any("several fragments" in p for r in s.kept for p in r.problems):
+    if any("several fragments" in p for r in library.noted for p in r.problems):
         note("Molecules with several fragments (salts) are reduced to their largest fragment, and simple charges "
              "are neutralised, before docking.")
     note("Stereocentres and tautomers are used as they are in your file; they are not enumerated. If a centre is "
-         "undefined, one arbitrary form is docked.")
+         "undefined, one arbitrary form is docked. Rings of 7 or more atoms are kept rigid.")
 
 
 # --------------------------------------------------------------------------
@@ -905,7 +923,8 @@ def step_settings(s, cfg):
     elif s.box_size > LARGE_BOX and "exhaustiveness" not in settings:
         s.exhaustiveness = max(s.exhaustiveness, 16)
         note(f"The box is large ({s.box_size:g} A), so the exhaustiveness is raised to {s.exhaustiveness}.")
-    seconds = vs_dock.PROGRAMS[s.program]["seconds_per_ligand"] * s.exhaustiveness / vs_dock.DEFAULT_EXHAUSTIVENESS
+    seconds = (vs_dock.PROGRAMS[s.program]["seconds_per_ligand"] * s.exhaustiveness
+               / vs_slurm.MEASURED_AT_EXHAUSTIVENESS)
     say(f"\n  {vs_dock.PROGRAMS[s.program]['title']}, exhaustiveness {s.exhaustiveness}, {s.num_modes} poses per "
         f"molecule, box {s.box_size:g} A"
         f"{', NNScore2 re-scoring' if s.rescore else ''}. About {seconds:.0f} s of one CPU per molecule.")
@@ -927,14 +946,14 @@ def input_paths(s):
 
 def staged_ligands(s):
     """The molecule file as the job will see it (a reduced copy if some molecules were left out)."""
-    if len(s.kept) == len(s.library):
+    if not s.exclude:
         return s.ligands
     if not s.ligand_stage:
         ext = os.path.splitext(s.ligands)[1].lower() or ".smi"
         folder = tempfile.mkdtemp(prefix="vs_ligands_")
         atexit.register(shutil.rmtree, folder, ignore_errors=True)
         s.ligand_stage = os.path.join(folder, f"molecules{ext}")
-        write_library(s.ligand_stage, s.kept)
+        write_library(s.ligand_stage, s.ligands, s.exclude)
     return s.ligand_stage
 
 
@@ -1028,11 +1047,11 @@ def choose_existing(s, cfg, earlier):
             say("       They are from a run whose inputs or settings differ from your current choices "
                 f"({', '.join(differences)}), so it cannot be resumed.")
         else:
-            say(f"       They are from a run with the same inputs and settings: {done} of {len(s.kept)} molecule(s) "
+            say(f"       They are from a run with the same inputs and settings: {done} of {s.n_kept} molecule(s) "
                 "are already docked.")
             if ask_yes_no("Resume it? Finished molecules are skipped, the rest are docked", True):
                 s.resume, s.force = True, False
-                s.remaining = max(0, len(s.kept) - done)
+                s.remaining = max(0, s.n_kept - done)
                 return True
         if ask_yes_no("Delete these results and write new ones there?", False):
             s.force, s.resume = True, False
@@ -1043,7 +1062,7 @@ def choose_existing(s, cfg, earlier):
         differences, done = earlier
         status = (f"They are from a run whose inputs or settings differ from this run file ({', '.join(differences)}), "
                   "so it cannot be resumed." if differences else
-                  f"They are from a run with the same inputs and settings: {done} of {len(s.kept)} molecule(s) are "
+                  f"They are from a run with the same inputs and settings: {done} of {s.n_kept} molecule(s) are "
                   "already docked.")
         raise Stop("'existing_output' is missing.\n"
                    f"  {s.outdir} already holds results. {status}\n"
@@ -1058,7 +1077,7 @@ def choose_existing(s, cfg, earlier):
             raise Stop("'existing_output: resume' is not possible: these differ from the earlier run: "
                        f"{', '.join(differences)}. Use 'overwrite' or another folder.")
         s.resume, s.force = True, False
-        s.remaining = max(0, len(s.kept) - done)
+        s.remaining = max(0, s.n_kept - done)
     else:
         s.force, s.resume = True, False
     return True
@@ -1113,7 +1132,7 @@ def step_run(s, cfg):
         s.resume, s.force = False, False
         if results_state(s) != "empty":
             choose_existing(s, cfg, previous_run(s) if results_state(s) == "ours" else None)
-    s.remaining = len(s.kept) if not s.resume else s.remaining
+    s.remaining = s.n_kept if not s.resume else s.remaining
 
     n = max(1, s.remaining)
     mb = n * (MB_PER_LIGAND_CLEAN if s.clean else MB_PER_LIGAND)
@@ -1147,8 +1166,8 @@ def step_run(s, cfg):
     suggested = vs_slurm.estimate_minutes(n, seconds, s.exhaustiveness, s.cpus, bool(s.rescore))
     s.time_limit = run.get("time") or fmt_minutes(suggested)
     if cfg is None:
-        say(f"  Time limit: estimated from {seconds} s of one CPU per molecule at the default exhaustiveness, "
-            "doubled for safety.")
+        say(f"  Time limit: estimated from {seconds * s.exhaustiveness / vs_slurm.MEASURED_AT_EXHAUSTIVENESS:.0f} s of "
+            "one CPU per molecule at this exhaustiveness, doubled for safety.")
         s.time_limit = ask("Time limit (hours:minutes:seconds)", s.time_limit, time_limit_validator)
     else:
         try:
@@ -1203,7 +1222,7 @@ def ensure_partition_access(s, cfg):
 
 def step_review(s, confirm=True):
     heading(5, TOTAL_STEPS, "Review")
-    names = ", ".join(r.name for r in s.kept[:3]) + (" ..." if len(s.kept) > 3 else "")
+    names = ", ".join(s.first_names) + (" ..." if s.n_kept > len(s.first_names) else "")
     if s.prepared is not None:
         protein = f"{s.structure_path} (chains {', '.join(s.prepared.kept_chains)}, cleaned)"
         site = f"centred on {s.template_label}: {s.center[0]:.2f} {s.center[1]:.2f} {s.center[2]:.2f}"
@@ -1212,7 +1231,7 @@ def step_review(s, confirm=True):
         what = "reference ligand " + os.path.basename(s.reference_ligand) if s.reference_ligand else "given centre"
         site = f"{what}: {s.center[0]:.2f} {s.center[1]:.2f} {s.center[2]:.2f}"
     rows = [("Protein", protein), ("Binding site", site), ("Search box", f"{s.box_size:g} A edge"),
-            ("Molecules", f"{len(s.kept)} of {len(s.library)} in {s.ligands} ({names})"),
+            ("Molecules", f"{s.n_kept:,} of {s.library.total:,} in {s.ligands} ({names})"),
             ("Program", f"{vs_dock.PROGRAMS[s.program]['title']}, exhaustiveness {s.exhaustiveness}, "
                         f"{s.num_modes} poses per molecule, seed {s.seed}")]
     if s.rescore:
@@ -1327,7 +1346,7 @@ def show_results(s, job_id=None):
     headers = ("Rank", "Molecule", "Score") + (("NNScore2 pKd",) if s.rescore else ())
     table([(n, r["name"][:32], r["best_score"]) + ((r.get("pkd_best", ""),) if s.rescore else ())
            for n, r in enumerate(docked[:10], 1)], headers=headers)
-    say(f"\n  {len(docked)} of {len(s.kept)} molecule(s) docked in {s.outdir}")
+    say(f"\n  {len(docked)} of {s.n_kept} molecule(s) docked in {s.outdir}")
     if failed:
         say(f"\n  {red(str(len(failed)) + ' molecule(s) failed.')} The others were still docked:")
         for r in sorted(failed, key=lambda r: int(r["index"]))[:10]:
@@ -1341,9 +1360,10 @@ def show_results(s, job_id=None):
         say("    top_poses.sdf               the best pose of every molecule (with all hydrogens)")
         say("    all_poses.sdf               every pose of every molecule")
         say("    ligands/<group>/<number>/   one folder per molecule, with its poses.sdf")
-        say("  Docking scores are estimates of binding strength. Use them to rank and to choose molecules to look at,")
-        say("  and check the poses; a good score does not prove that a molecule binds.")
-    if job_id and len(docked) + len(failed) < len(s.kept):
+        say("  Docking scores are rough estimates of binding strength. They favour large, flat, aromatic molecules, so")
+        say("  look at score together with molecule size, and check the poses; a good score does not prove that a")
+        say("  molecule binds.")
+    if job_id and len(docked) + len(failed) < s.n_kept:
         log = os.path.join(s.rundir, f"{s.jobname}_{job_id}.log")
         if os.path.isfile(log):
             say(f"\n  Last lines of {log}:")

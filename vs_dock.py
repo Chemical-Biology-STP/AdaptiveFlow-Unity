@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -54,12 +55,17 @@ PROGRAMS = {
     "AutodockVina_1.2": {"title": "AutoDock Vina 1.2.3", "seconds_per_ligand": 21, "unsupported": ("B", "Se"),
                          "text": "current Vina; also accepts silicon"},
     "PSOVina": {"title": "PSOVina 2.0", "seconds_per_ligand": 3, "unsupported": ("B", "Si", "Se"),
-                "text": "particle-swarm search; very fast"},
+                "text": "fastest, but less accurate and not reproducible (it ignores the random seed)"},
     "smina": {"title": "smina (Oct 2019)", "seconds_per_ligand": 31, "unsupported": ("B", "Si", "Se"),
               "text": "Vina fork with extra scoring options"},
 }
+# Elements that Meeko can give an AutoDock atom type (tested element by element). A molecule with any other element
+# cannot be prepared, so it is flagged before the job starts instead of failing with "atom has None type".
+TYPED_ELEMENTS = frozenset("H B C N O F Mg Si P S Cl Ca Mn Fe Zn Br I".split())
 DEFAULT_PROGRAM = "qvina"
-DEFAULT_EXHAUSTIVENESS = 8
+# 16, not Vina's usual 8: in a redocking test on 12 crystal complexes QuickVina found the crystal pose as its top
+# pose for 7 of 12 at exhaustiveness 8 and 9 of 12 at 16 or 32 (the two it missed were both recovered at 16).
+DEFAULT_EXHAUSTIVENESS = 16
 DEFAULT_NUM_MODES = 9
 DEFAULT_SEED = 1
 DEFAULT_BOX = 20.0
@@ -135,37 +141,71 @@ def ligand_name(mol, index):
     return f"molecule_{index + 1}"
 
 
-def read_ligands(path):
-    """Read a ligand file (.sdf, .smi, .smiles, .txt, .csv with SMILES). Returns [(name, mol_or_None, error)].
+def iter_ligands(path):
+    """Read a ligand file one molecule at a time (.sdf, .smi, .smiles, .txt, .csv with SMILES).
 
-    SMILES files: one molecule per line, "SMILES name"; a header line is skipped; "," and tab also separate.
+    Yields (index, name, mol_or_None, error). The index counts molecules in the file (a SMILES header line is not
+    one), so the wizard and the job always agree on which molecule is which. Nothing is kept in memory.
+
+    SMILES files: one molecule per line, "SMILES name"; a header line is skipped; space, "," ";" and tab separate.
     """
     from rdkit import Chem, RDLogger
 
     RDLogger.DisableLog("rdApp.*")
-    rows = []
     if path.lower().endswith(".sdf"):
         for i, mol in enumerate(Chem.SDMolSupplier(path)):
             if mol is None:
-                rows.append((f"molecule_{i + 1}", None, "RDKit could not read this molecule"))
+                yield i, f"molecule_{i + 1}", None, "RDKit could not read this molecule"
             else:
-                rows.append((ligand_name(mol, i), mol, ""))
-        return rows
+                yield i, ligand_name(mol, i), mol, ""
+        return
+    index = 0
     with open(path, errors="replace") as fh:
-        lines = [l.strip() for l in fh if l.strip() and not l.lstrip().startswith("#")]
-    for i, line in enumerate(lines):
-        parts = [p for p in re.split(r"[\s,;]+", line) if p]
-        smiles = parts[0]
-        name = parts[1] if len(parts) > 1 else f"molecule_{len(rows) + 1}"
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            if i == 0 and not rows:            # a header such as "smiles,name"
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
                 continue
-            rows.append((name, None, f"'{smiles[:40]}' is not a valid SMILES"))
-            continue
-        mol.SetProp("_Name", name)
-        rows.append((name, mol, ""))
-    return rows
+            parts = [p for p in re.split(r"[\s,;]+", line) if p]
+            smiles = parts[0]
+            name = parts[1] if len(parts) > 1 else f"molecule_{index + 1}"
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                if index == 0:             # a header such as "smiles,name"
+                    continue
+                yield index, name, None, f"'{smiles[:40]}' is not a valid SMILES"
+            else:
+                mol.SetProp("_Name", name)
+                yield index, name, mol, ""
+            index += 1
+
+
+def read_ligands(path):
+    """All molecules of a file as a list of (name, mol_or_None, error). Fine for short files; use iter_ligands for
+    libraries."""
+    return [(name, mol, error) for _, name, mol, error in iter_ligands(path)]
+
+
+def count_ligands(path):
+    """How many molecules iter_ligands will yield, without parsing them (SMILES: only the first line is parsed)."""
+    from rdkit import Chem, RDLogger
+
+    RDLogger.DisableLog("rdApp.*")
+    if path.lower().endswith(".sdf"):
+        with open(path, errors="replace") as fh:
+            return sum(1 for line in fh if line.startswith("$$$$"))
+    count, first = 0, True
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if first:
+                first = False
+                parts = [p for p in re.split(r"[\s,;]+", line) if p]
+                if Chem.MolFromSmiles(parts[0]) is None:
+                    continue               # header
+            count += 1
+    return count
 
 
 def blocked_elements(mol, program):
@@ -174,24 +214,34 @@ def blocked_elements(mol, program):
     return sorted({a.GetSymbol() for a in mol.GetAtoms() if a.GetSymbol() in bad})
 
 
+def untyped_elements(mol):
+    """Elements in the molecule that have no AutoDock atom type (metals and metalloids, mostly)."""
+    return sorted({a.GetSymbol() for a in mol.GetAtoms() if a.GetSymbol() not in TYPED_ELEMENTS})
+
+
 def embed_ligand(mol, timeout=EMBED_TIMEOUT_SECONDS, seed=DEFAULT_SEED):
-    """Add hydrogens and generate 3D coordinates. Raises LigandError if RDKit cannot (it only signals that through
-    its return value and leaves a molecule without coordinates, which would be docked as a flat structure)."""
+    """Add hydrogens and generate 3D coordinates. Raises LigandError if RDKit cannot. RDKit reports most failures only
+    through its return value (and leaves a molecule without coordinates, which would be docked as a flat structure),
+    but some molecules, for example metal complexes with unusual bonding, make it raise an exception instead."""
     from rdkit import Chem
     from rdkit.Chem import AllChem
 
-    mol_h = Chem.AddHs(mol, addCoords=True)
-    params = AllChem.ETKDGv3()
-    params.timeout = timeout
-    params.randomSeed = seed
-    if AllChem.EmbedMolecule(mol_h, params) != 0:
-        retry = AllChem.ETKDGv3()
-        retry.timeout = timeout
-        retry.randomSeed = seed
-        retry.useRandomCoords = True            # RDKit's usual fallback for hard-to-embed molecules
-        if AllChem.EmbedMolecule(mol_h, retry) != 0:
-            raise LigandError("RDKit could not generate 3D coordinates (strained or impossible geometry or "
-                              "stereochemistry)")
+    reason = ("RDKit could not generate 3D coordinates (strained or impossible geometry or stereochemistry, "
+              "or an unusual structure such as a metal complex)")
+    try:
+        mol_h = Chem.AddHs(mol, addCoords=True)
+        params = AllChem.ETKDGv3()
+        params.timeout = timeout
+        params.randomSeed = seed
+        if AllChem.EmbedMolecule(mol_h, params) != 0:
+            retry = AllChem.ETKDGv3()
+            retry.timeout = timeout
+            retry.randomSeed = seed
+            retry.useRandomCoords = True            # RDKit's usual fallback for hard-to-embed molecules
+            if AllChem.EmbedMolecule(mol_h, retry) != 0:
+                raise LigandError(reason)
+    except (RuntimeError, ValueError):
+        raise LigandError(reason)
     return mol_h
 
 
@@ -204,7 +254,10 @@ def ligand_to_pdbqt(mol, seed=DEFAULT_SEED):
     cleaned_smiles = Chem.MolToSmiles(Chem.RemoveHs(mol))
     mol_h = embed_ligand(mol, seed=seed)
     try:
-        setups = MoleculePreparation().prepare(mol_h)
+        # rigid_macrocycles: by default Meeko writes special ring-closure atom types (CG, G0) that Vina-family
+        # programs cannot read; 23 of 4,961 molecules of the NCI test set failed that way. Rings of 7 or more atoms
+        # are then rigid instead of flexible.
+        setups = MoleculePreparation(rigid_macrocycles=True).prepare(mol_h)
         text, success, error = PDBQTWriterLegacy.write_string(setups[0])
     except Exception as exc:
         raise LigandError(f"Meeko could not prepare this molecule ({type(exc).__name__}: {str(exc)[:100]})")
@@ -224,6 +277,10 @@ def check_ligand(name, mol, program):
     elements = blocked_elements(mol, program)
     if elements:
         problems.append(f"contains {', '.join(elements)}, which {PROGRAMS[program]['title']} cannot read")
+    untyped = [e for e in untyped_elements(mol) if e not in elements]
+    if untyped:
+        problems.append(f"contains {', '.join(untyped)}, which has no AutoDock atom type (metal complexes and "
+                        "organometallics cannot be docked)")
     heavy = mol.GetNumHeavyAtoms()
     if heavy < 3:
         problems.append(f"has only {heavy} heavy atom(s)")
@@ -301,7 +358,7 @@ def dock_one(job):
     """Prepare, dock and (optionally) re-score one ligand. Runs in a worker process; never raises.
 
     job: dict with index, name, mol (RDKit binary), folder, and the run settings.
-    Returns a result row (dict with RESULT_COLUMNS) plus 'mol_block_top' and 'mol_blocks_all' for the SDF files.
+    Returns a result row (dict with RESULT_COLUMNS). The poses are written to the ligand's own poses.sdf.
     """
     from rdkit import Chem, RDLogger
 
@@ -310,14 +367,19 @@ def dock_one(job):
     index, name, folder = job["index"], job["name"], job["folder"]
     row = {"index": index, "name": name, "status": "failed", "best_score": "", "n_poses": "", "pkd_best": "",
            "note": "", "smiles": ""}
-    top_block, all_blocks = "", []
+    all_blocks = []
     try:
         os.makedirs(folder, exist_ok=True)
         mol = Chem.Mol(job["mol"])        # binary form: keeps stereochemistry that a molblock without coordinates loses
         row["smiles"] = Chem.MolToSmiles(Chem.RemoveHs(mol))
-        blocked = blocked_elements(clean_molecule(mol)[0], job["program"])
+        cleaned = clean_molecule(mol)[0]
+        blocked = blocked_elements(cleaned, job["program"])
         if blocked:
             raise LigandError(f"contains {', '.join(blocked)}, which {PROGRAMS[job['program']]['title']} cannot read")
+        untyped = untyped_elements(cleaned)
+        if untyped:
+            raise LigandError(f"contains {', '.join(untyped)}, which has no AutoDock atom type (metal complexes and "
+                              "organometallics cannot be docked)")
         pdbqt, clean_note, row["smiles"] = ligand_to_pdbqt(mol, job["seed"])   # the SMILES that was docked
         ligand_file = os.path.join(folder, "ligand.pdbqt")
         with open(ligand_file, "w") as fh:
@@ -362,8 +424,6 @@ def dock_one(job):
                      ("ligand", "pose_rank", "score_kcal_mol", "program") + (("nnscore2_pkd",) if pose.HasProp("nnscore2_pkd") else ())]
             sd_block = block + "".join(p + "\n" for p in props) + "$$$$\n"
             all_blocks.append(sd_block)
-            if rank == 1:
-                top_block = sd_block
         row.update(status="docked", best_score=f"{scores[order[0]]:.3f}", n_poses=n_poses,
                    pkd_best=f"{pkd[order[0]]:.3f}" if pkd and len(pkd) == n_poses else "",
                    note="; ".join(x for x in (clean_note, row["note"], f"{time.time() - started:.0f} s") if x))
@@ -388,7 +448,6 @@ def dock_one(job):
                 fh.write(row["note"] + "\n")
         except OSError:
             pass
-    row["top_block"], row["all_blocks"] = top_block, all_blocks
     return row
 
 
@@ -422,32 +481,67 @@ def signature_differences(old, new):
 
 
 def read_results(outdir):
+    """Results written so far, as {index: row}. The file is a journal while a run is going (one line appended per
+    finished molecule, so a stopped job loses nothing); when the same molecule appears twice, the later line wins.
+    Lines cut off by a killed job are ignored, and that molecule is simply docked again on resume."""
     path = os.path.join(outdir, SUMMARY_FILE)
+    rows = {}
     if not os.path.isfile(path):
-        return {}
+        return rows
     with open(path, newline="") as fh:
-        return {int(r["index"]): r for r in csv.DictReader(fh) if r.get("index", "").isdigit()}
+        for row in csv.DictReader(fh):
+            index, status = row.get("index") or "", row.get("status") or ""
+            if index.isdigit() and status and None not in row.values():
+                rows[int(index)] = row
+    return rows
+
+
+class ResultsJournal:
+    """Appends one result line per finished molecule: constant cost however long the run is (rewriting the whole
+    table each time took 144 s of a 10,000-molecule run)."""
+
+    def __init__(self, outdir, fresh):
+        self.path = os.path.join(outdir, SUMMARY_FILE)
+        if fresh or not os.path.isfile(self.path):
+            with open(self.path, "w", newline="") as fh:
+                csv.DictWriter(fh, fieldnames=RESULT_COLUMNS).writeheader()
+        self.fh = open(self.path, "a", newline="")
+        self.writer = csv.DictWriter(self.fh, fieldnames=RESULT_COLUMNS, extrasaction="ignore", restval="")
+
+    def add(self, row):
+        self.writer.writerow(row)
+        self.fh.flush()
+
+    def close(self):
+        self.fh.close()
 
 
 def write_results(outdir, rows):
+    """The final table: one line per molecule, in input order (replaces the journal)."""
     path = os.path.join(outdir, SUMMARY_FILE)
     tmp = path + ".tmp"
     with open(tmp, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=RESULT_COLUMNS, extrasaction="ignore")
+        writer = csv.DictWriter(fh, fieldnames=RESULT_COLUMNS, extrasaction="ignore", restval="")
         writer.writeheader()
         for index in sorted(rows):
             writer.writerow(rows[index])
     os.replace(tmp, path)               # a job killed mid-write must not leave a half-written table
 
 
-def write_sdf_files(outdir, rows_by_index, folders):
+def ligand_folder(outdir, index):
+    """The folder of one molecule. Folders are grouped by thousands (ligands/0000/000042): a single folder with
+    100,000 subfolders is very slow on a shared file system."""
+    return os.path.join(outdir, "ligands", f"{index // 1000:04d}", f"{index:06d}")
+
+
+def write_sdf_files(outdir, rows_by_index):
     """top_poses.sdf and all_poses.sdf, rebuilt from the per-ligand folders (so a resumed run is complete)."""
     top_path, all_path = os.path.join(outdir, "top_poses.sdf"), os.path.join(outdir, "all_poses.sdf")
     with open(top_path, "w") as top, open(all_path, "w") as every:
         for index in sorted(rows_by_index):
             if rows_by_index[index].get("status") != "docked":
                 continue
-            sdf = os.path.join(folders[index], "poses.sdf")
+            sdf = os.path.join(ligand_folder(outdir, index), "poses.sdf")
             if not os.path.isfile(sdf):
                 continue
             with open(sdf) as fh:
@@ -578,58 +672,106 @@ def main(argv=None):
             return 1
     print("Receptor prepared.", flush=True)
 
-    library = read_ligands(args.ligands)
-    if not library:
+    total = count_ligands(args.ligands)
+    if total == 0:
         print("Error: no molecules were found in the ligand file.", file=sys.stderr)
         return 2
-    # Folders are grouped by thousands (ligands/0000/000042): a single folder with 100,000 subfolders is very slow
-    # on a shared file system.
-    folders = {i: os.path.join(args.outdir, "ligands", f"{i // 1000:04d}", f"{i:06d}") for i in range(len(library))}
-    rows = read_results(args.outdir) if args.resume else {}
-    rows = {i: r for i, r in rows.items() if r.get("status") == "docked"}        # failed ligands are redone
-    jobs, final = [], dict(rows)
-    from rdkit import Chem
 
-    for i, (name, mol, error) in enumerate(library):
-        if i in rows:
-            continue
-        if mol is None:
-            final[i] = {"index": i, "name": name, "status": "failed", "note": error}
-            continue
-        jobs.append({"index": i, "name": name, "mol": mol.ToBinary(), "folder": folders[i],
-                     "program": args.program, "receptor": receptor_pdbqt,
-                     "box": {"center": args.center, "size": args.size}, "exhaustiveness": args.exhaustiveness,
-                     "num_modes": args.num_modes, "seed": args.seed, "rescore": args.rescore, "clean": args.clean})
-    skipped = len(rows)
-    workers = max(1, min(args.cpus or available_cpus(), len(jobs) or 1))
-    print(f"{len(library)} ligand(s): {skipped} already done, {len(jobs)} to dock, {workers} at a time.", flush=True)
+    earlier = read_results(args.outdir) if args.resume else {}
+    final = {i: r for i, r in earlier.items() if r.get("status") == "docked"}       # failed molecules are redone
+    write_results(args.outdir, final)                  # a clean table of what is done; new lines are appended to it
+    journal = ResultsJournal(args.outdir, fresh=False)
+    workers = max(1, min(args.cpus or available_cpus(), total - len(final) or 1))
+    print(f"{total} molecule(s): {len(final)} already done, {total - len(final)} to dock, {workers} at a time.",
+          flush=True)
 
-    done = 0
-    write_results(args.outdir, final)
+    def jobs():
+        """Molecules still to do, read from the file one at a time (a library may hold millions)."""
+        for index, name, mol, error in iter_ligands(args.ligands):
+            if index in final:
+                continue
+            if mol is None:
+                yield {"unreadable": True, "index": index, "name": name, "note": error}
+                continue
+            yield {"index": index, "name": name, "mol": mol.ToBinary(), "folder": ligand_folder(args.outdir, index),
+                   "program": args.program, "receptor": receptor_pdbqt,
+                   "box": {"center": args.center, "size": args.size}, "exhaustiveness": args.exhaustiveness,
+                   "num_modes": args.num_modes, "seed": args.seed, "rescore": args.rescore, "clean": args.clean}
+
+    def record(row):
+        final[row["index"]] = {k: row.get(k, "") for k in RESULT_COLUMNS}
+        journal.add(final[row["index"]])
+
+    def terminate(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, terminate)       # SLURM sends SIGTERM when the time limit is reached
+    todo = total - len(final)
+    done, started, last_report = 0, time.time(), time.time()
+    broken = False
+    pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers)
+    pending = {}                                    # future -> (index, name); never more than a few per worker
+    stream = jobs()
+    window = workers * 4
     try:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(dock_one, job): job for job in jobs}
-            for future in concurrent.futures.as_completed(futures):
-                job = futures[future]
+        while True:
+            while len(pending) < window and not broken:
+                job = next(stream, None)
+                if job is None:
+                    break
+                if job.get("unreadable"):
+                    record({"index": job["index"], "name": job["name"], "status": "failed", "note": job["note"]})
+                    done += 1
+                    print(f"[{done}/{todo}] {job['name']}: FAILED: {job['note']}", flush=True)
+                    continue
+                try:
+                    pending[pool.submit(dock_one, job)] = (job["index"], job["name"])
+                except concurrent.futures.BrokenExecutor:
+                    broken = True
+            if not pending:
+                break
+            finished, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in finished:
+                index, name = pending.pop(future)
                 try:
                     row = future.result()
-                except Exception as exc:                          # the worker itself died (for example out of memory)
-                    row = {"index": job["index"], "name": job["name"], "status": "failed",
+                except Exception as exc:                  # a worker died (for example out of memory)
+                    row = {"index": index, "name": name, "status": "failed",
                            "note": f"worker stopped: {type(exc).__name__}: {exc}"}
-                final[row["index"]] = {k: row.get(k, "") for k in RESULT_COLUMNS}
+                    broken = broken or isinstance(exc, concurrent.futures.BrokenExecutor)
+                record(row)
                 done += 1
-                write_results(args.outdir, final)                  # after every ligand, so a killed job loses nothing
-                shown = row["best_score"] if row["status"] == "docked" else f"FAILED: {row['note']}"
-                print(f"[{done}/{len(jobs)}] {row['name']}: {shown}", flush=True)
+                failed_now = row["status"] != "docked"
+                now = time.time()
+                if failed_now or todo <= 200 or now - last_report >= 60:
+                    shown = f"FAILED: {row['note']}" if failed_now else row["best_score"]
+                    rate = done / max(1e-9, now - started)
+                    eta = f", about {(todo - done) / rate / 60:.0f} min left" if done >= workers and todo > 200 else ""
+                    print(f"[{done}/{todo}] {row['name']}: {shown}{eta}", flush=True)
+                    last_report = now
+            if broken and not pending:
+                break
     except KeyboardInterrupt:
-        print("Interrupted. Finished ligands are kept; run again with --resume.", file=sys.stderr)
+        pool.shutdown(wait=False, cancel_futures=True)
+        journal.close()
+        write_results(args.outdir, final)
+        print(f"Stopped after {done} of {todo} molecule(s). Finished molecules are kept; run again with --resume.",
+              file=sys.stderr, flush=True)
         return 130
+    pool.shutdown(wait=True, cancel_futures=True)
+    journal.close()
+    if broken:
+        write_results(args.outdir, final)
+        print("A worker process died (most likely out of memory). Finished molecules are kept; run again with "
+              "--resume, with fewer CPUs or more memory.", file=sys.stderr, flush=True)
+        return 1
 
-    write_sdf_files(args.outdir, final, folders)
+    write_results(args.outdir, final)                  # sorted by input order, replacing the journal
+    write_sdf_files(args.outdir, final)
     write_ranked_table(args.outdir, final)
     failed = [r for r in final.values() if r.get("status") != "docked"]
-    docked = len(final) - len(failed)
-    print(f"\nFinished: {docked} docked, {len(failed)} failed. Results are in {args.outdir}", flush=True)
+    print(f"\nFinished: {len(final) - len(failed)} docked, {len(failed)} failed. Results are in {args.outdir}",
+          flush=True)
     return 1 if failed else 0
 
 

@@ -356,7 +356,7 @@ output: results/run1             # results folder
 # --- 4. Docking settings (all optional; these are the assistant's recommendations) ----------------------------
 docking:
   program: qvina                 # qvina | qvina-w | vina | AutodockVina_1.2 | PSOVina | smina
-  # exhaustiveness: 8            # search effort per ligand (higher is slower and more thorough)
+  # exhaustiveness: 16           # search effort per ligand (higher is slower and more thorough)
   # num_modes: 9                 # poses kept per ligand
   # box_size: 20                 # box edge in Angstrom (default: the ligand's size + 10, at least 20)
   # seed: 1                      # random seed

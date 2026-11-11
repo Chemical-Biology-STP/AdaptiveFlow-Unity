@@ -46,10 +46,9 @@ and a receptor prepared by ADFR).
 | `vina` (Vina 1.1.2) | The original Vina |
 | `qvina-w` (QuickVina-W 1.1) | For large boxes |
 | `smina` | Vina fork |
-| `PSOVina` (2.0) | Particle-swarm search; about 7 times faster here |
+| `PSOVina` (2.0) | Particle-swarm search; about 7 times faster, but it found the crystal pose less often in the redocking test and it ignores the random seed, so repeating a run gives different scores (differences of 0.3 kcal/mol typically, up to 0.9) |
 
-Boron and selenium make every program reject a molecule; silicon is accepted only by Vina 1.2. The assistant flags such
-molecules before the job starts. NNScore2 re-scoring is the one re-scoring method offered.
+Boron and selenium make every program reject a molecule; silicon is accepted only by Vina 1.2. Metals and metalloids other than Mg, Ca, Mn, Fe and Zn (so most organometallics and metal complexes) have no AutoDock atom type and cannot be docked. The assistant flags such molecules before the job starts, naming the element. NNScore2 re-scoring is the one re-scoring method offered.
 Other programs and scoring functions listed in `config.txt` are available through classic mode, but have not been tested
 here and several need software or licences that are not part of this repository.
 
@@ -92,14 +91,55 @@ choose to resume: finished molecules are skipped and failed ones are retried. Re
 the molecules, the box or any setting that changes scores is different. Results are only ever deleted if this tool
 made the folder.
 
+### How far to trust the results
+
+Redocking test: 13 crystal structures from the PDB (HIV protease, EGFR, trypsin, streptavidin, estrogen receptor, Abl,
+Hsp90, DHFR, CDK2, acetylcholinesterase), each docked back into its own protein through this tool (clean-up,
+PDB2PQR or ADFR hydrogens, Meeko, the programs below), with the ligand taken from its SMILES. A pose counts as correct
+if its heavy-atom RMSD to the crystal pose is 2 Angstrom or less (symmetry-aware, no re-alignment).
+
+| Program (exhaustiveness) | Top-ranked pose correct | Any of 9 poses correct |
+|---|---|---|
+| QuickVina (8) | 7 of 13 | 10 of 13 |
+| QuickVina (32) | 9 of 13 | 10 of 13 |
+| Vina 1.2 (8) | 9 of 13 | 10 of 13 |
+| smina (8) | 9 of 13 | 10 of 13 |
+| PSOVina (8) | 5 of 13 | 5 of 13 |
+
+- This is why the default exhaustiveness is 16 and not Vina's usual 8. Exhaustiveness 16 was run on five of the
+  complexes only, including both that QuickVina missed at 8 (1HSG and 1UYG): it found all five, as 32 did, where 8 found
+  three. It takes twice as long as 8.
+- Three complexes fail with every program (1HVR, a 46-atom flexible ligand; 4DFR, charged methotrexate; 1GPK,
+  acetylcholinesterase). Scoring the crystal pose itself showed 1M17 and 4DFR to be scoring failures (the crystal pose
+  scores worse than the wrong pose that is ranked first) and 1HVR a search failure (the crystal pose scores 2.2 kcal/mol
+  better than anything found).
+- The test measures pose prediction, not whether the scores rank molecules correctly. That needs a set of known
+  actives and decoys for the target, which was not run here.
+- Scores favour large, flat, aromatic molecules. On 4,999 molecules of the NCI set docked into BACE1, score correlated
+  with the number of heavy atoms (r = -0.63), the best scores were polycyclic aromatic hydrocarbons, and the top 100
+  had a median of 29 heavy atoms against 15 for the whole set. Look at score together with size.
+- QuickVina, Vina 1.2 and smina give identical scores when a run is repeated with the same seed. PSOVina does not
+  (scores differed by up to 0.9 kcal/mol, typically 0.3).
+- 3 of the 13 structures could not be protonated by PDB2PQR because of missing backbone atoms; the tool says so and
+  suggests ADFR's hydrogens, which were used for those three. The choice affects scores: the BACE1 test ligand scored
+  -9.6 with PDB2PQR hydrogens and -8.8 with ADFR's.
+
 ### Size of a run
 
 One CPU docks one molecule at a time; the job docks as many at once as it has CPUs (the assistant suggests up to 32,
 the partition has up to 256 per node). The time limit is estimated from measured times at one CPU per molecule
-(PSOVina 3 s, QuickVina 20 s, smina 31 s at the default exhaustiveness) and doubled. A job is limited to 7 days; for
-larger libraries use more CPUs or resume in a second job. Each molecule gets a folder, grouped by thousands; for
-500 molecules or more the intermediate files are deleted as it goes. The largest run tested here had 13 molecules; larger
-libraries use the same code but have not been run.
+(PSOVina 3 s, QuickVina 20 s, smina 31 s at exhaustiveness 8; the default of 16 takes twice as long) and doubled. A job
+is limited to 7 days; for larger libraries use more CPUs or resume in a second job.
+
+Measured: 4,961 molecules of the NCI set (PSOVina, exhaustiveness 8, 64 CPUs) took 16 minutes, and 12 minutes after
+molecules that cannot be docked started failing at once. The job used 9.6 GB of memory in all (about 150 MB per
+worker), and CPU use was about 80%. The job reads the library one molecule at a time, keeps only a few in flight,
+and appends one line per finished molecule to `results/results.csv`, so a stopped job loses nothing; stopping one with
+SIGTERM (what SLURM sends at the time limit) and resuming gave a complete, duplicate-free table.
+The first version rewrote the whole table after every molecule, which took 144 s of bookkeeping at 10,000 molecules.
+Libraries of 100,000 molecules or more use the same code but have not been run. Expect about 55 KB of output per
+molecule (measured: 282 MB for 4,999 molecules, of which 158 MB is the per-molecule `poses.sdf` files; with 9 poses
+each), so 100,000 molecules need about 5.5 GB. Each molecule gets its own folder, grouped by thousands.
 
 ## Prerequisites (standalone use)
 The suite installs all of this. On its own, the tool needs [Pixi](https://pixi.sh/) (0.83.0 or newer):

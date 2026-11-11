@@ -42,7 +42,12 @@ def mail_address():
     return f"{user}@{MAIL_DOMAIN}" if re.fullmatch(r"[A-Za-z0-9._-]+", user) else None
 
 
-def estimate_minutes(n_ligands, seconds_per_ligand, exhaustiveness, cpus, rescore=False, default_exhaustiveness=8):
+# seconds_per_ligand in vs_dock.PROGRAMS were measured at exhaustiveness 8 and scale linearly with it
+MEASURED_AT_EXHAUSTIVENESS = 8
+
+
+def estimate_minutes(n_ligands, seconds_per_ligand, exhaustiveness, cpus, rescore=False,
+                     default_exhaustiveness=MEASURED_AT_EXHAUSTIVENESS):
     """A generous time limit, in minutes, for docking n_ligands on `cpus` CPUs at the same time."""
     per_ligand = seconds_per_ligand * exhaustiveness / default_exhaustiveness + (5 if rescore else 0) + 2
     work = n_ligands * per_ligand / max(1, min(cpus, n_ligands)) / 60
