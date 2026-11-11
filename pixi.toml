@@ -1,8 +1,8 @@
 [workspace]
-channels = ["conda-forge"]
+channels = ["conda-forge", "https://conda.anaconda.org/hcc"]
 name = "virtual_screening"
 platforms = ["linux-64"]
-version = "0.1.0"
+version = "0.2.0"
 
 [tasks]
 vs = "python vs_cli.py"
@@ -13,3 +13,17 @@ rdkit = ">=2026.9.2,<2027"
 numpy = ">=2.5.4,<3"
 selfies = ">=2.2.0,<3"
 openbabel = ">=3.2.1,<4"
+meeko = ">=0.8.0,<0.9"
+gemmi = ">=0.7.5,<0.8"
+scipy = ">=1.18.1,<2"
+pdb2pqr = ">=3.8.0,<4"
+propka = ">=3.5.1,<4"
+pyyaml = ">=6.0.3,<7"
+
+# ADFRsuite (prepare_receptor) ships its own Python 2.7 and overwrites `python` in the environment's bin/,
+# so it lives in a separate environment. Install it with `pixi install --all`.
+[feature.adfr.dependencies]
+adfr-suite = ">=1.0,<2"
+
+[environments]
+adfr = { features = ["adfr"], no-default-feature = true }

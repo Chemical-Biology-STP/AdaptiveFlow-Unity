@@ -1,55 +1,125 @@
 # VF Unity
 Streamlined version of AdaptiveFlow combining both AFVS and AFLP
 
-## Running with the Drug Discovery Suite (recommended)
+## Quick start
 
 > **Using the lab's Drug Discovery Suite?** Then there is nothing to install or clone. Run `ddsuite vs` from the
-> folder that holds your config file (see the suite's README for the one-time `ddsuite setup`).
+> folder with your files (see the suite's README for the one-time `ddsuite setup`). The `pixi run` commands in this
+> README are for using this repository on its own.
 
 ```bash
-ddsuite vs --example > config.txt     # write an annotated example config file, then edit it
-ddsuite vs config.txt --check         # check the config file and the receptor; runs nothing
-ddsuite vs config.txt                 # run; results go to ./vs_run
-ddsuite vs config.txt -o results/run1 # choose the run folder
+ddsuite vs                       # the assistant: asks its questions, then submits the job
+ddsuite vs run.yaml              # the same steps with all answers in a run file
+ddsuite vs run.yaml --check      # check a run file and show what would be done, run nothing
+ddsuite vs --example             # print an annotated example run file
+ddsuite vs config.txt            # classic mode: the original VF Unity workflow (see below)
 ```
 
-The launcher (`vs_cli.py`) makes a new **run folder** for every run, so your own folder and the shared installation
-are never written to. The run folder holds:
+### What the assistant does
+
+It docks a library of molecules into a protein with a Vina-family program and ranks them by score. It asks for:
+
+1. **The protein and the binding site.** Either a protein-ligand complex (PDB or mmCIF, e.g. from rcsb.org), which it
+   cleans up for you and centres the box on the ligand in it, or a protein PDB file plus a ligand in the site (SDF) or
+   the centre coordinates. If the protein has no hydrogens it adds them with PDB2PQR and PROPKA at a pH you choose
+   (or ADFR's quicker rule-based guess).
+2. **The docking settings.** The program, and whether to re-score with NNScore2.
+3. **The molecules.** An SDF file, or a text file with one SMILES per line (`SMILES name`, a header line is fine).
+   Any number works. Molecules that cannot be docked are listed with the reason, and you can leave them out.
+4. **How to run.** Submit to the cluster (SLURM, partition `ncpu`), run in the terminal, or only save the job script.
+   It suggests the number of CPUs and a time limit, and checks with the scheduler that your account may use the
+   partition.
+5. **A review** of everything, before anything is submitted.
+
+Everything you answer is saved as `run.yaml`, so the run can be repeated, or changed and run again, with
+`ddsuite vs run.yaml`.
+
+### Programs
+
+All six were run end to end on a real receptor and ligand (the BACE1 case, with a ligand prepared by RDKit and Meeko
+and a receptor prepared by ADFR).
+
+| Program | Notes |
+|---|---|
+| `qvina` (QuickVina 2.1) | Fast Vina variant; the default |
+| `AutodockVina_1.2` (Vina 1.2.3) | Current Vina; the only one that also accepts silicon |
+| `vina` (Vina 1.1.2) | The original Vina |
+| `qvina-w` (QuickVina-W 1.1) | For large boxes |
+| `smina` | Vina fork |
+| `PSOVina` (2.0) | Particle-swarm search; about 7 times faster here |
+
+Boron and selenium make every program reject a molecule; silicon is accepted only by Vina 1.2. The assistant flags such
+molecules before the job starts. NNScore2 re-scoring is the one re-scoring method offered.
+Other programs and scoring functions listed in `config.txt` are available through classic mode, but have not been tested
+here and several need software or licences that are not part of this repository.
+
+### What is prepared, and how
+
+| Step | Done with |
+|---|---|
+| Complex clean-up (chains, waters, additives, ions, cofactors) | `structure_prep.py` (gemmi) |
+| Protonation | PDB2PQR with PROPKA, or ADFR (`prepare_receptor -A checkhydrogens`) |
+| Receptor to PDBQT | ADFRsuite `prepare_receptor` |
+| Each molecule | Largest fragment kept, simple charges neutralised, 3D coordinates from RDKit (ETKDG), PDBQT from Meeko |
+| Poses back to molecules | Meeko, so every pose has all its hydrogens |
+
+Stereocentres and tautomers are used exactly as in your file; they are not enumerated. A centre without a defined
+configuration is docked in one arbitrary form.
+
+### The run folder
+
+Everything for one run is kept in one folder, and your input files are never changed:
 
 | In the run folder | What it is |
 |---|---|
-| `config.txt` | A copy of your config file, with `receptor=` pointing at the linked receptor |
-| `config/` | Links to this tool's helper files, plus a link to your receptor file |
-| `executables` | Link to the docking programs shipped with this tool |
-| `ligands/`, `outputs/` | Prepared 3D ligands and docked poses (written by the workflow) |
-| `docking_output.csv`, `rescoring_output.csv` | The result tables described below |
+| `input/` | Copies of the receptor and the molecules the job used |
+| `run.yaml` | The answers, to repeat the run |
+| `submit_<job name>.sh`, `<job name>_<id>.log` | The job script and its log |
+| `protonation_report.txt` | What PDB2PQR did (when it was used) |
+| `results/ranking.csv` | All molecules, best score first (score in kcal/mol, more negative is better) |
+| `results/results.csv` | The same in input order, with the SMILES that was docked and any note or failure reason |
+| `results/top_poses.sdf`, `results/all_poses.sdf` | Best pose of each molecule, and every pose (all hydrogens, with score properties) |
+| `results/ligands/<group>/<number>/poses.sdf` | One folder per molecule |
 
-- **`receptor=`** in your config can be an absolute path, or relative to the config file (or the current folder). Use a
-  receptor in the format the chosen docking program needs (PDBQT for the Vina family). The shipped example
-  `./config/5wiu_test.pdbqt` also works. Paths must not contain spaces.
-- An existing run folder is never overwritten unless you add `--force`, and then only if this launcher made it.
-- Docking programs that are not shipped here (Glide and CovDock need a Schrödinger licence, GOLD, FRED and others have
-  their own requirements) are listed in [Special Considerations](#special-considerations); the launcher warns when the
-  chosen program is not among the shipped ones.
-- The Python function-call examples below call `run_vf_unity.main` directly and must be run inside a folder laid out
-  like a run folder. The launcher does that for you.
+A molecule that fails (cannot be read, has no 3D geometry, contains an unsupported element) is reported with its reason
+and the others are still docked; the job then exits with an error so that it shows as failed in the queue.
+Docking scores estimate binding strength; use them to rank and to choose molecules to inspect, and look at the poses.
+
+### Resuming
+
+The job writes `results.csv` after every molecule. If a job is stopped or runs out of time, run `run.yaml` again and
+choose to resume: finished molecules are skipped and failed ones are retried. Resuming is refused if the receptor,
+the molecules, the box or any setting that changes scores is different. Results are only ever deleted if this tool
+made the folder.
+
+### Size of a run
+
+One CPU docks one molecule at a time; the job docks as many at once as it has CPUs (the assistant suggests up to 32,
+the partition has up to 256 per node). The time limit is estimated from measured times at one CPU per molecule
+(PSOVina 3 s, QuickVina 20 s, smina 31 s at the default exhaustiveness) and doubled. A job is limited to 7 days; for
+larger libraries use more CPUs or resume in a second job. Each molecule gets a folder, grouped by thousands; for
+500 molecules or more the intermediate files are deleted as it goes. The largest run tested here had 13 molecules; larger
+libraries use the same code but have not been run.
 
 ## Prerequisites (standalone use)
 The suite installs all of this. On its own, the tool needs [Pixi](https://pixi.sh/) (0.83.0 or newer):
 ```
 git clone git@github.com:Chemical-Biology-STP/AdaptiveFlow-Unity.git
 cd AdaptiveFlow-Unity
-pixi install
-pixi run python vs_cli.py config.txt
+pixi install --all
+pixi run python vs_cli.py
 ```
-This creates one environment with Python 3.11 or newer, RDKit, Open Babel, SELFIES and NumPy
-(see `pixi.toml`). The original code was written against RDKit 2021.09.5, Open Babel 3.1.0 and Python 3.7; it has been
-run with the versions in `pixi.lock` (QuickVina with and without NNScore2 re-scoring).
-Programs that are not Python packages (AmberTools, Chimera, dock6, licensed software) are not part of the environment.
-
+`--all` also builds the separate `adfr` environment with ADFRsuite (its conda package bundles Python 2.7, so it cannot
+share the main environment). The main environment holds Python 3.12, RDKit, Meeko, Open Babel, PDB2PQR and PROPKA
+(see `pixi.toml`).
 
 ## File Navigator
-* `vs_cli.py`: Launcher used by `ddsuite vs`. Builds a run folder and runs `run_vf_unity.py` inside it. 
+* `vs_cli.py`: Entry point of `ddsuite vs`: the assistant, a run file, or classic mode. 
+* `vs_wizard.py`: The assistant's steps (protein, binding site, settings, molecules, how to run, review). 
+* `vs_dock.py`: The docking engine used by the assistant and by the job script (receptor and ligand preparation, docking, re-scoring, results). 
+* `vs_slurm.py`, `vs_runfile.py`, `vs_ui.py`: The SLURM job script, the YAML run file, and terminal helpers. 
+* `structure_prep.py`, `protein_prep.py`: Complex clean-up and protonation (from the anchored_docking_workflow repository, see `NOTICE.md`). 
+* `vs_classic.py`: Classic mode: builds a run folder and runs `run_vf_unity.py` inside it. 
 * `run_vf_unity.py`: Main file that initiates docking calculations. 
 * `initiate_calc.py`: File that initiates scoring and docking calculations. 
 * `lig_process.py`: Process provided ligand into 3D format compatible with docking program (used by )
@@ -60,6 +130,9 @@ Programs that are not Python packages (AmberTools, Chimera, dock6, licensed soft
 * `/outputs/`: Directory created by VF Unity, which will contain docked ligand files. 
 
 
+
+## Classic mode (the original VF Unity workflow, from a config.txt file)
+`ddsuite vs config.txt` runs the original workflow below in a new run folder (`--example-config` prints a config file, `-o` chooses the folder). It supports many more programs than the assistant, but only `qvina` and `qvina+nnscore2` were tested here. It docks one molecule given as a SMILES string, and enumerates stereoisomers and tautomers.
 
 ## Quick Start (Using a config.txt file)
 We will be running QuickVina on a processed protein located in the config directory (`5wiu_test.pdbqt`). We provide a config.txt file which contains all parmeters for this simple run. 

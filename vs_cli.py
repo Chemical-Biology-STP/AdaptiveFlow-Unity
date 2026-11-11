@@ -1,170 +1,49 @@
 #!/usr/bin/env python3
-"""Launcher for the virtual screening workflow (VF Unity).
+"""Virtual screening: dock a library of molecules into a protein with a Vina-family program and rank them.
 
-The workflow code expects to run inside a folder that holds ./config, ./executables and ./config.txt, and it writes
-./ligands, ./outputs and the result tables into that same folder. A tool installed in the Drug Discovery Suite is
-shared and started from the user's own folder, so this launcher builds a separate run folder for every run:
+    vs                    the interactive assistant: asks for the protein, the binding site, the molecules and
+                          the settings, then submits the job to the cluster (or runs it)
+    vs run.yaml           the same steps with all the answers in a run file (the assistant writes one for every run)
+    vs run.yaml --check   check a run file and show what would be done, without running anything
+    vs config.txt         classic mode: the original VF Unity workflow from a config file (many programs)
+    vs --example          print an annotated example run file
 
-    <run folder>/config.txt       copy of the user's config file, with the receptor line pointing at ./config/
-    <run folder>/config/          links to the helper files shipped here, plus a link to the user's receptor
-    <run folder>/executables      link to the docking programs shipped here
-    <run folder>/ligands, outputs, docking_output.csv ...   written by the workflow
-
-and then runs the unchanged workflow (run_vf_unity.py) inside it. The user's files and the installed tool are never
-written to.
-
-Start it with:  ddsuite vs config.txt   (or, on its own:  pixi run python vs_cli.py config.txt)
+Start it with `ddsuite vs` (Drug Discovery Suite) or `pixi run python vs_cli.py` (standalone).
 """
 
 import argparse
 import os
-import shutil
-import subprocess
 import sys
+import warnings
+
+# Meeko imports ProDy, whose source has invalid escape sequences; Python warns about them whenever it has to compile
+# the files (on a shared install nobody can write the compiled copies). The warnings mean nothing to users.
+warnings.filterwarnings("ignore")
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, REPO_DIR)
 
-# The lab's launcher (ddsuite) sets DDSUITE_RUN_COMMAND, e.g. "ddsuite vs". It is used in messages that tell the
-# user how to start this tool; on its own the tool is started with `pixi run python vs_cli.py`.
 RUN_COMMAND = os.environ.get("DDSUITE_RUN_COMMAND") or "pixi run python vs_cli.py"
-
-SHIPPED_CONFIG = os.path.join(REPO_DIR, "config.txt")   # annotated example, also used by --example
-SHIPPED_CONFIG_DIR = os.path.join(REPO_DIR, "config")
-SHIPPED_EXECUTABLES = os.path.join(REPO_DIR, "executables")
-WORKFLOW_SCRIPT = os.path.join(REPO_DIR, "run_vf_unity.py")
-
-DEFAULT_RUN_DIR = "vs_run"
-MARKER = ".vs_run"          # written into every run folder this launcher makes; --force only deletes folders with it
-IGNORED_CONFIG_FILES = {".DS_Store"}
-REQUIRED_KEYS = ("program_choice", "center_x", "center_y", "center_z", "size_x", "size_y", "size_z",
-                 "exhaustiveness", "smi", "is_selfies", "is_peptide", "receptor")
-NUMERIC_KEYS = ("center_x", "center_y", "center_z", "size_x", "size_y", "size_z")
-
-
-class SetupError(Exception):
-    """A problem with the user's input, reported without a traceback."""
-
-
-def read_config(path):
-    """Return (lines, settings) of a config file, read the way run_vf_unity.read_config_file reads it."""
-    try:
-        with open(path) as fh:
-            lines = fh.read().splitlines()
-    except OSError as exc:
-        raise SetupError(f"Cannot read the config file {path}: {exc.strerror}.")
-    settings = {}
-    for line in lines:
-        text = line.strip()
-        if not text or text.startswith("#") or "=" not in text:
-            continue
-        key, value = text.split("=", 1)
-        settings[key.strip()] = value.strip()
-    return lines, settings
-
-
-def check_settings(settings):
-    """Problems with the settings, as a list of messages (empty if fine)."""
-    problems = [f"'{key}' is missing." for key in REQUIRED_KEYS if not settings.get(key)]
-    for key in NUMERIC_KEYS:
-        if settings.get(key):
-            try:
-                float(settings[key])
-            except ValueError:
-                problems.append(f"'{key}' must be a number, not '{settings[key]}'.")
-    if settings.get("exhaustiveness"):
-        try:
-            int(settings["exhaustiveness"])
-        except ValueError:
-            problems.append(f"'exhaustiveness' must be a whole number, not '{settings['exhaustiveness']}'.")
-    for key in ("is_selfies", "is_peptide"):
-        if settings.get(key) and settings[key] not in ("True", "False"):
-            problems.append(f"'{key}' must be True or False, not '{settings[key]}'.")
-    return problems
-
-
-def program_notes(program_choice):
-    """Warnings about the chosen docking program (and scoring function, written as program+scoring)."""
-    notes = []
-    program = program_choice.split("+")[0]
-    if program and not os.path.isfile(os.path.join(SHIPPED_EXECUTABLES, program)):
-        notes.append(f"No program named '{program}' is shipped with this tool. That is expected for programs that "
-                     "are installed separately (for example Glide or GOLD); otherwise the choice is misspelled "
-                     "(see the list at the top of config.txt).")
-    return notes
-
-
-def resolve_receptor(value, config_dir):
-    """Find the receptor file named in the config. Relative paths are tried against the config file's folder, the
-    current folder and this tool's own folder (which makes './config/5wiu_test.pdbqt' find the shipped example)."""
-    value = os.path.expanduser(os.path.expandvars(value))
-    candidates = [value] if os.path.isabs(value) else [os.path.join(base, value)
-                                                       for base in (config_dir, os.getcwd(), REPO_DIR)]
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            path = os.path.abspath(candidate)
-            if os.path.getsize(path) == 0:
-                raise SetupError(f"The receptor file is empty: {path}")
-            return path
-    raise SetupError(f"Receptor file not found: {value}\n"
-                     "  Give its path in the config file (relative to the config file, or absolute).")
-
-
-def check_path_text(label, path):
-    # The workflow builds shell command lines without quoting, so spaces would break them.
-    if any(ch.isspace() for ch in path):
-        raise SetupError(f"{label} contains a space, which the workflow cannot handle: {path}")
-
-
-def prepare_run_dir(run_dir, config_lines, receptor, force):
-    """Create the run folder as described in the module docstring."""
-    if os.path.lexists(run_dir):
-        if not force:
-            raise SetupError(f"{run_dir} already exists. Choose another folder with --output, or add --force to "
-                             "replace it (only a folder made by this tool is replaced).")
-        if not os.path.isfile(os.path.join(run_dir, MARKER)):
-            raise SetupError(f"{run_dir} was not made by this tool, so it will not be replaced. "
-                             "Choose another folder with --output.")
-        shutil.rmtree(run_dir)
-
-    receptor_name = os.path.basename(receptor)
-    shipped = {n for n in os.listdir(SHIPPED_CONFIG_DIR) if n not in IGNORED_CONFIG_FILES}
-    clash = os.path.join(SHIPPED_CONFIG_DIR, receptor_name)
-    if receptor_name in shipped and os.path.realpath(receptor) != os.path.realpath(clash):
-        raise SetupError(f"The receptor file name '{receptor_name}' is also the name of a helper file of this tool. "
-                         "Rename your receptor file.")
-
-    os.makedirs(os.path.join(run_dir, "config"))
-    for name in sorted(shipped):
-        os.symlink(os.path.join(SHIPPED_CONFIG_DIR, name), os.path.join(run_dir, "config", name))
-    if receptor_name not in shipped:
-        os.symlink(receptor, os.path.join(run_dir, "config", receptor_name))
-    os.symlink(SHIPPED_EXECUTABLES, os.path.join(run_dir, "executables"))
-
-    with open(os.path.join(run_dir, "config.txt"), "w") as fh:
-        for line in config_lines:
-            if line.strip().startswith("receptor") and line.split("=", 1)[0].strip() == "receptor":
-                line = f"receptor=./config/{receptor_name}"
-            fh.write(line + "\n")
-    with open(os.path.join(run_dir, MARKER), "w") as fh:
-        fh.write("Made by vs_cli.py; safe to replace with --force.\n")
+RUN_FILE_EXTENSIONS = (".yaml", ".yml")
 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         prog=RUN_COMMAND,
-        description="Run the virtual screening workflow (docking and optional re-scoring of a molecule) in a new "
-                    "run folder, using the settings in a config file.")
-    parser.add_argument("config", nargs="?", default="config.txt",
-                        help="config file with the docking settings (default: ./config.txt)")
-    parser.add_argument("-o", "--output", default=DEFAULT_RUN_DIR,
-                        help=f"run folder to create; results are written inside it (default: ./{DEFAULT_RUN_DIR})")
-    parser.add_argument("--force", action="store_true",
-                        help="replace the run folder if an earlier run of this tool made it")
+        description="Dock a library of molecules into a protein with a Vina-family program and rank them by score. "
+                    f"Run it with no arguments for the interactive assistant, or give it a run file: "
+                    f"`{RUN_COMMAND} run.yaml`.")
+    parser.add_argument("file", nargs="?",
+                        help="a run file (.yaml) holding all the answers, or a classic config file (config.txt)")
     parser.add_argument("--check", action="store_true",
-                        help="check the config file and the receptor, then stop without running anything")
-    parser.add_argument("--example", action="store_true",
-                        help="print an annotated example config file and exit "
-                             f"(save it with: {RUN_COMMAND} --example > config.txt)")
+                        help="check the file and show what would be done, without running anything")
+    parser.add_argument("--example", action="store_true", help="print an annotated example run file and exit")
+    parser.add_argument("--example-config", action="store_true",
+                        help="print an annotated example classic config file and exit")
+    parser.add_argument("-o", "--output", default=None,
+                        help="classic mode only: run folder to create (default: ./vs_run)")
+    parser.add_argument("--force", action="store_true",
+                        help="classic mode only: replace the run folder if an earlier run of this tool made it")
     return parser.parse_args(argv)
 
 
@@ -172,48 +51,42 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
 
     if args.example:
-        with open(SHIPPED_CONFIG) as fh:
-            sys.stdout.write(fh.read())
+        import vs_runfile
+
+        sys.stdout.write(vs_runfile.EXAMPLE)
         return 0
+    if args.example_config:
+        import vs_classic
 
-    try:
-        config_path = os.path.abspath(args.config)
-        config_lines, settings = read_config(config_path)
-        problems = check_settings(settings)
-        if problems:
-            raise SetupError(f"Problems in {args.config}:\n" + "\n".join(f"  - {p}" for p in problems))
-        receptor = resolve_receptor(settings["receptor"], os.path.dirname(config_path))
-        run_dir = os.path.abspath(args.output)
-        check_path_text("The run folder path", run_dir)
-        check_path_text("The receptor path", receptor)
-        for note in program_notes(settings["program_choice"]):
-            print(f"  [!]  {note}")
+        return vs_classic.main(["--example"])
 
-        print(f"Config:    {config_path}")
-        print(f"Program:   {settings['program_choice']}")
-        print(f"Receptor:  {receptor}")
-        print(f"Run folder: {run_dir}")
-        if args.check:
-            print("Checks passed; nothing was run (--check).")
-            return 0
-        prepare_run_dir(run_dir, config_lines, receptor, args.force)
-    except SetupError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+    is_run_file = bool(args.file) and args.file.lower().endswith(RUN_FILE_EXTENSIONS)
+    if args.file and not is_run_file:
+        if args.output is None:
+            args.output = "vs_run"
+        import vs_classic
+
+        return vs_classic.main([args.file, "-o", args.output] + (["--force"] if args.force else [])
+                               + (["--check"] if args.check else []))
+    if args.output is not None or args.force:
+        print("--output and --force belong to classic mode (a config.txt file). The assistant and run files keep "
+              "everything in a run folder that you choose.", file=sys.stderr)
+        return 2
+    if args.check and not args.file:
+        print("--check needs a run file.", file=sys.stderr)
         return 2
 
-    print("\nRunning the workflow...\n")
-    result = subprocess.run([sys.executable, WORKFLOW_SCRIPT], cwd=run_dir, check=False)
+    import vs_wizard
 
-    print()
-    results_csv = os.path.join(run_dir, "docking_output.csv")
-    if result.returncode != 0:
-        print(f"The workflow stopped with an error (exit code {result.returncode}). "
-              f"Files so far are in {run_dir}.", file=sys.stderr)
-        return result.returncode
-    print(f"Finished. Results are in {run_dir}:")
-    print(f"  docking_output.csv   {'(written)' if os.path.isfile(results_csv) else '(not written)'}")
-    print("  outputs/             docked poses")
-    print("  ligands/             prepared 3D ligands")
+    vs_wizard.check_environment()
+    if args.file:
+        vs_wizard.run_from_file(args.file, args.check)
+        return 0
+    if not sys.stdin.isatty():
+        print(f"The assistant asks questions, so it needs a terminal. In a script, give it a run file instead: "
+              f"`{RUN_COMMAND} run.yaml`.", file=sys.stderr)
+        return 2
+    vs_wizard.run_interactive()
     return 0
 
 
