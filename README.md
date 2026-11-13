@@ -59,10 +59,30 @@ here and several need software or licences that are not part of this repository.
 | Complex clean-up (chains, waters, additives, ions, cofactors) | `structure_prep.py` (gemmi) |
 | Protonation | PDB2PQR with PROPKA, or ADFR (`prepare_receptor -A checkhydrogens`) |
 | Receptor to PDBQT | ADFRsuite `prepare_receptor` |
-| Each molecule | Largest fragment kept, simple charges neutralised, 3D coordinates from RDKit (ETKDG), PDBQT from Meeko |
+| Each molecule | Largest fragment kept, charge state set for a pH (or kept as written), 3D coordinates from RDKit (ETKDG), PDBQT from Meeko |
 | Poses back to molecules | Meeko, so every pose has all its hydrogens |
 
-Stereocentres and tautomers are used exactly as in your file; they are not enumerated. A centre without a defined
+**Charge states.** By default each molecule is set to its charge state at pH 7.4 (a pH you can change), whatever
+the file shows: carboxylic, sulfonic and phosphoric acids and tetrazoles become anions, aliphatic amines, amidines and
+guanidines cations. This uses Open Babel's pH model plus two extra rules (sulfonic acids and acylsulfonamides, which it
+misses). A check that the molecule is otherwise unchanged (same atoms, bonds and stereochemistry) falls back to the
+input if it fails. Choose `ionisation: keep` to use the charges exactly as written, for a library that was already
+prepared at a given pH, for example from ZINC. Rule-based assignment is approximate: it was right for 48 of 49 test
+molecules (partly tuned to those) and 17 of 20 real drugs not used to design it. It gives every aliphatic amine a pKa
+of 10, so weak bases such as N-arylpiperazines (sildenafil) are charged when they are mostly neutral, and it misses
+acids such as 4-hydroxycoumarins (warfarin) and 4-aminopyridine-type bases. Only the single most likely state is
+docked; molecules whose pKa is close to the pH are not docked as both forms. It also over-charges some molecules with
+two nearby amines: indinavir is given +2, though its published pKa values (about 3.7 and 6.2) make it mostly neutral at pH 7.4.
+
+Effect on pose accuracy, measured by redocking 10 ligands with QuickVina (exhaustiveness 16, one seed, neutral SMILES as
+the input): the top pose was within 2 Å of the crystal pose for 7 of 10 with charge states set and 7 of 10 without.
+The setting changed the molecule in 6 of the 10. The top-pose error got smaller in 3 (indinavir 1.3 to 0.8 Å, biotin 1.3
+to 0.8 Å, benzamidine 0.40 to 0.35 Å), larger in 2 (huperzine 2.7 to 4.3 Å, methotrexate 5.7 to 6.0 Å, both failures
+either way) and stayed the same in 1. Ten complexes cannot show a difference this small. Vina-type scoring has no
+electrostatic term, so charges matter mainly through how hydrogen-bond donors and acceptors are assigned; the main
+reason for the default is that the molecule drawn is the one present in water, not that poses were found to improve.
+
+Tautomers and stereoisomers are used exactly as in your file; they are not enumerated. A centre without a defined
 configuration is docked in one arbitrary form.
 
 ### The run folder
@@ -127,19 +147,36 @@ if its heavy-atom RMSD to the crystal pose is 2 Angstrom or less (symmetry-aware
 ### Size of a run
 
 One CPU docks one molecule at a time; the job docks as many at once as it has CPUs (the assistant suggests up to 32,
-the partition has up to 256 per node). The time limit is estimated from measured times at one CPU per molecule
-(PSOVina 3 s, QuickVina 20 s, smina 31 s at exhaustiveness 8; the default of 16 takes twice as long) and doubled. A job
-is limited to 7 days; for larger libraries use more CPUs or resume in a second job.
+the partition has up to 256 per node). The time limit is estimated from times at one CPU per molecule (QuickVina 38 s,
+smina 59 s, PSOVina 6 s at exhaustiveness 8; the default of 16 takes twice as long) and doubled. Only the QuickVina
+figure was measured on a drug-like library; the others are scaled from smaller test molecules. A job is limited to 7
+days; for larger libraries use more CPUs or resume in a second job.
 
-Measured: 4,961 molecules of the NCI set (PSOVina, exhaustiveness 8, 64 CPUs) took 16 minutes, and 12 minutes after
-molecules that cannot be docked started failing at once. The job used 9.6 GB of memory in all (about 150 MB per
-worker), and CPU use was about 80%. The job reads the library one molecule at a time, keeps only a few in flight,
-and appends one line per finished molecule to `results/results.csv`, so a stopped job loses nothing; stopping one with
-SIGTERM (what SLURM sends at the time limit) and resuming gave a complete, duplicate-free table.
-The first version rewrote the whole table after every molecule, which took 144 s of bookkeeping at 10,000 molecules.
-Libraries of 100,000 molecules or more use the same code but have not been run. Expect about 55 KB of output per
-molecule (measured: 282 MB for 4,999 molecules, of which 158 MB is the per-molecule `poses.sdf` files; with 9 poses
-each), so 100,000 molecules need about 5.5 GB. Each molecule gets its own folder, grouped by thousands.
+Measured, 100,000 molecules: a random sample of the Enamine screening collection (99,982 molecules after leaving out
+18 that contain boron or silicon), docked with QuickVina at exhaustiveness 16 on one 256-CPU node, took 8 h 25 min:
+8 h 16 min of docking, about 12,000 molecules per hour, and 9 min to write the final files. All 99,982 were docked, none
+failed. Per molecule, docking took 75 s on average (median 71 s, 5th to 95th percentile 26 to 142 s, longest 413 s), and
+94% of the allocated CPU time went into docking. Memory peaked at 40.7 GB (159 MB per CPU). The output was 7.5 GB (75 KB
+per molecule: 3.3 GB in `all_poses.sdf`, 3.9 GB in the per-molecule folders, 0.4 GB in `top_poses.sdf`). The receptor
+was the small Bace1 test pocket, so this shows speed and reliability, not that the scores rank real actives well.
+Resuming a copy of this run with the last 200 molecules removed from the table docked only those 200, and gave a table
+with the same scores for every molecule and a byte-identical `all_poses.sdf`; it took 19 min on 32 CPUs, 9 of them for
+the final files. Of 2,000 molecules docked twice with the same seed, 1,996 gave identical scores and 4 differed by at
+most 0.3 kcal/mol.
+
+Earlier, smaller runs: 4,961 molecules of the NCI set (PSOVina, exhaustiveness 8, 64 CPUs) took 16 minutes, and 12
+minutes after molecules that cannot be docked started failing at once. The first version rewrote the whole table after
+every molecule, which took 144 s of bookkeeping at 10,000 molecules. The job now reads the library one molecule at a
+time, keeps only a few in flight, and appends one line per finished molecule to `results/results.csv`, so a stopped job
+loses nothing; stopping one with SIGTERM (what SLURM sends at the time limit) and resuming gave a complete,
+duplicate-free table. Each molecule gets its own folder, grouped by thousands.
+
+### Tests
+From the tool folder: `pixi run test` runs 331 fast tests (about 15 seconds: ligand preparation, charge states, results
+table, run files, SLURM scripts, wizard, command line). `pixi run test-all` adds 36 tests that dock with the real
+programs on a small receptor (about 7 more minutes): every offered program, resume after a stop, a killed worker
+process, and the output files. The tests do not judge whether docking scores are scientifically good; they check that
+the tool does what it says.
 
 ## Prerequisites (standalone use)
 The suite installs all of this. On its own, the tool needs [Pixi](https://pixi.sh/) (0.83.0 or newer):

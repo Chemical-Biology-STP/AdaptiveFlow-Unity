@@ -31,3 +31,6 @@ SOFTWARE.
 MIT-licensed code may be included in a GPL v2 project; this notice keeps the original copyright and permission
 text with the copied files. Several terminal helpers and the structure of the run-file and job-script code in
 `vs_wizard.py` follow the same repository's `dock_cli.py` and `runfile.py`.
+
+The test receptor and ligand in `test/data/` (`pocket.pdb`, `pocket_noh.pdb`, `crystal_ligand.sdf`) are cut from the BACE1 test
+complex of the same repository and are covered by the same licence.

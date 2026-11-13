@@ -22,7 +22,7 @@ RUN_FILE_EXTENSIONS = (".yaml", ".yml")
 TOP_KEYS = ("structure", "template_molecule", "chains", "keep_molecules", "receptor", "reference_ligand",
             "box_center", "ligands", "output", "existing_output", "protonation", "ph", "flagged_ligands",
             "docking", "run")
-DOCKING_KEYS = ("program", "exhaustiveness", "num_modes", "seed", "box_size", "rescore")
+DOCKING_KEYS = ("program", "exhaustiveness", "num_modes", "seed", "box_size", "rescore", "ionisation", "ligand_ph")
 RUN_KEYS = ("mode", "job_name", "time", "cpus", "partition", "watch")
 
 
@@ -232,6 +232,12 @@ def _read_docking(section, problems):
         out["seed"] = _number(section["seed"], "docking.seed", problems, int, 0)
     if "box_size" in section:
         out["box_size"] = _number(section["box_size"], "docking.box_size", problems, float, 1.0, 126.0)
+    if section.get("ionisation") is not None:
+        out["ionisation"] = _choice(section["ionisation"], "docking.ionisation", vs_dock.IONISATION_MODES, problems)
+    if section.get("ligand_ph") is not None:
+        out["ligand_ph"] = _number(section["ligand_ph"], "docking.ligand_ph", problems, float, 0.0, 14.0)
+        if out.get("ionisation") == "keep":
+            problems.add("docking.ligand_ph", "only applies with 'ionisation: ph'")
     if section.get("rescore") is not None:
         value = section["rescore"]
         out["rescore"] = None if value is False or (isinstance(value, str) and value.lower() == "none") else \
@@ -316,7 +322,7 @@ def render(values, run_command="vs"):
     for name, comments in (("docking", {
             "program": " | ".join(vs_dock.PROGRAMS), "exhaustiveness": "search effort per ligand",
             "num_modes": "poses kept per ligand", "seed": "random seed", "box_size": "box edge in Angstrom",
-            "rescore": "nnscore2 | none"}),
+            "rescore": "nnscore2 | none", "ionisation": "ph | keep", "ligand_ph": "pH for the molecules"}),
             ("run", {"mode": "submit | run | save", "job_name": "", "time": "time limit, hours:minutes:seconds",
                      "cpus": "ligands docked at the same time", "partition": "", "watch": "wait for the job"})):
         section = {k: v for k, v in (values.get(name) or {}).items() if v is not None}
@@ -361,6 +367,8 @@ docking:
   # box_size: 20                 # box edge in Angstrom (default: the ligand's size + 10, at least 20)
   # seed: 1                      # random seed
   # rescore: nnscore2            # re-score the poses with NNScore2 (default: none)
+  # ionisation: ph               # ph: set each molecule's charge state for a pH (default) | keep: use the charges in the file
+  # ligand_ph: 7.4               # the pH, with 'ionisation: ph' 
 
 # --- 5. How to run it -----------------------------------------------------------------------------------------
 run:

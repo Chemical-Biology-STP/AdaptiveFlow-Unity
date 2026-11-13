@@ -6,6 +6,9 @@ version = "0.2.0"
 
 [tasks]
 vs = "python vs_cli.py"
+# Fast tests (331 tests, about 15 seconds). `pixi run test-all` also runs the 36 that dock with the real programs (about 7 more minutes).
+test = "pytest test -q -m 'not slow'"
+test-all = "pytest test -q"
 
 [dependencies]
 python = ">=3.11"
@@ -19,6 +22,7 @@ scipy = ">=1.18.1,<2"
 pdb2pqr = ">=3.8.0,<4"
 propka = ">=3.5.1,<4"
 pyyaml = ">=6.0.3,<7"
+pytest = ">=9.2.0,<10"
 
 # ADFRsuite (prepare_receptor) ships its own Python 2.7 and overwrites `python` in the environment's bin/,
 # so it lives in a separate environment. Install it with `pixi install --all`.

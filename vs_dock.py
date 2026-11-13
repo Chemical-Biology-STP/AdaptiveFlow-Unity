@@ -25,6 +25,7 @@ import concurrent.futures
 import csv
 import hashlib
 import json
+import multiprocessing
 import os
 import re
 import shutil
@@ -43,26 +44,33 @@ NNSCORE2_VINA = os.path.join(EXECUTABLES, "AutodockVina_1.1.2")
 DEFAULT_ADFR_PATH = os.path.join(REPO_DIR, ".pixi", "envs", "adfr")
 
 # Programs that were run end to end on a Meeko-prepared ligand and an ADFR-prepared receptor.
-#   seconds_per_ligand: measured on one CPU at exhaustiveness 8 (used only to suggest a time limit)
+#   seconds_per_ligand: CPU seconds per molecule at exhaustiveness 8 (used only to suggest a time limit). QuickVina:
+#   38, half of the 75 s measured at exhaustiveness 16 on 99,982 random Enamine screening molecules (5th to 95th
+#   percentile 26 to 142 s; the first 2,000 of them took 66.5 s on average). The earlier 20 s came from the smaller NCI
+#   test molecules. The other programs were timed only on the NCI molecules (QuickVina-W 25, Vina 20, Vina 1.2 21,
+#   PSOVina 3, smina 31 s) and are scaled by the same 1.9, so they are estimates for drug-like libraries, not
+#   measurements.
 #   unsupported: elements that the program refuses to read in a PDBQT file
 PROGRAMS = {
-    "qvina": {"title": "QuickVina 2.1", "seconds_per_ligand": 20, "unsupported": ("B", "Si", "Se"),
+    "qvina": {"title": "QuickVina 2.1", "seconds_per_ligand": 38, "unsupported": ("B", "Si", "Se"),
               "text": "fast Vina variant; a good default for screening"},
-    "qvina-w": {"title": "QuickVina-W 1.1", "seconds_per_ligand": 25, "unsupported": ("B", "Si", "Se"),
+    "qvina-w": {"title": "QuickVina-W 1.1", "seconds_per_ligand": 48, "unsupported": ("B", "Si", "Se"),
                 "text": "QuickVina for large boxes (blind docking)"},
-    "vina": {"title": "AutoDock Vina 1.1.2", "seconds_per_ligand": 20, "unsupported": ("B", "Si", "Se"),
+    "vina": {"title": "AutoDock Vina 1.1.2", "seconds_per_ligand": 38, "unsupported": ("B", "Si", "Se"),
              "text": "the original Vina"},
-    "AutodockVina_1.2": {"title": "AutoDock Vina 1.2.3", "seconds_per_ligand": 21, "unsupported": ("B", "Se"),
+    "AutodockVina_1.2": {"title": "AutoDock Vina 1.2.3", "seconds_per_ligand": 40, "unsupported": ("B", "Se"),
                          "text": "current Vina; also accepts silicon"},
-    "PSOVina": {"title": "PSOVina 2.0", "seconds_per_ligand": 3, "unsupported": ("B", "Si", "Se"),
+    "PSOVina": {"title": "PSOVina 2.0", "seconds_per_ligand": 6, "unsupported": ("B", "Si", "Se"),
                 "text": "fastest, but less accurate and not reproducible (it ignores the random seed)"},
-    "smina": {"title": "smina (Oct 2019)", "seconds_per_ligand": 31, "unsupported": ("B", "Si", "Se"),
+    "smina": {"title": "smina (Oct 2019)", "seconds_per_ligand": 59, "unsupported": ("B", "Si", "Se"),
               "text": "Vina fork with extra scoring options"},
 }
 # Elements that Meeko can give an AutoDock atom type (tested element by element). A molecule with any other element
 # cannot be prepared, so it is flagged before the job starts instead of failing with "atom has None type".
 TYPED_ELEMENTS = frozenset("H B C N O F Mg Si P S Cl Ca Mn Fe Zn Br I".split())
 DEFAULT_PROGRAM = "qvina"
+DEFAULT_PH = 7.4
+IONISATION_MODES = ("ph", "keep")     # ph: assign protonation states at a pH; keep: use the charges in the file
 # 16, not Vina's usual 8: in a redocking test on 12 crystal complexes QuickVina found the crystal pose as its top
 # pose for 7 of 12 at exhaustiveness 8 and 9 of 12 at 16 or 32 (the two it missed were both recovered at 16).
 DEFAULT_EXHAUSTIVENESS = 16
@@ -112,8 +120,99 @@ def prepare_receptor(workdir, receptor_pdb, adfr_path=DEFAULT_ADFR_PATH, add_hyd
 # --------------------------------------------------------------------------
 
 
-def clean_molecule(mol):
-    """Keep the largest fragment (drops salts and counter-ions) and neutralise simple charges.
+def _skeleton(mol):
+    """The molecule with all charges removed and no hydrogens: what must be unchanged by ionisation."""
+    from rdkit import Chem
+
+    copy = Chem.RWMol(Chem.RemoveHs(mol))
+    for atom in copy.GetAtoms():
+        atom.SetFormalCharge(0)
+        atom.SetNumExplicitHs(0)
+        atom.SetNoImplicit(False)
+    try:
+        Chem.SanitizeMol(copy)
+    except Exception:
+        pass
+    return Chem.MolToSmiles(copy)
+
+
+# Groups Open Babel's pH model misses, added where the state is unambiguous. Each is (SMARTS of the acidic oxygen or
+# nitrogen, the pKa used, the reason). They are applied only when pH is at least two units above the pKa.
+EXTRA_ACID_RULES = (
+    ("[SX4](=O)(=O)[OX2H1:1]", 0.0, "sulfonic acid, pKa about -2 to 1 (Open Babel misses it when the substituent is a "
+                                    "carbon with no other heavy neighbours, e.g. methanesulfonic acid)"),
+    ("[CX3](=O)[NX3H1:1][SX4](=O)(=O)", 4.5, "acylsulfonamide, pKa about 4 to 5"),
+)
+
+
+def _apply_extra_acids(mol, ph):
+    """Deprotonate the acid groups of EXTRA_ACID_RULES that Open Babel left alone. Returns (molecule, changed)."""
+    from rdkit import Chem
+
+    work, changed = Chem.RWMol(mol), False
+    for smarts, pka, _ in EXTRA_ACID_RULES:
+        if ph < pka + 2.0:
+            continue
+        pattern = Chem.MolFromSmarts(smarts)
+        for match in work.GetSubstructMatches(pattern):
+            atom = work.GetAtomWithIdx(match[[a.GetAtomMapNum() for a in pattern.GetAtoms()].index(1)])
+            if atom.GetFormalCharge() == 0 and atom.GetTotalNumHs() >= 1:
+                atom.SetFormalCharge(-1)
+                atom.SetNumExplicitHs(max(0, atom.GetTotalNumHs() - 1))
+                atom.SetNoImplicit(True)
+                changed = True
+    if changed:
+        try:
+            Chem.SanitizeMol(work)
+        except Exception:
+            return mol, False
+    return work.GetMol(), changed
+
+
+def ionise(mol, ph=DEFAULT_PH):
+    """Protonation state of `mol` at `ph`, using Open Babel's pH model (a list of about 30 pKa-tagged rules for
+    carboxylic, sulfonic and phosphoric acids, aliphatic amines, amidines and guanidines, tetrazoles and so on).
+
+    Returns (molecule, changed). Falls back to the input if Open Babel fails or if the result is not the same molecule
+    apart from protons, so ionisation can never alter the structure of a ligand.
+
+    Tested on 49 molecules with unambiguous states at pH 7.4: 45 correct without the extra rules, 48 with them. The
+    one known miss is 4-aminopyridine-type bases (no safe general rule). Groups with a pKa close to the pH (imidazole, morpholine) are decided by a rule
+    that cannot know the environment.
+    """
+    from openbabel import openbabel as ob
+    from rdkit import Chem
+
+    try:
+        neutral = Chem.MolToSmiles(mol)
+        conv = ob.OBConversion()
+        conv.SetInAndOutFormats("smi", "smi")
+        obmol = ob.OBMol()
+        if not conv.ReadString(obmol, neutral):
+            return mol, False
+        obmol.AddHydrogens(False, True, float(ph))      # polaronly=False, correctForPH=True
+        result = Chem.MolFromSmiles(conv.WriteString(obmol).split()[0])
+    except Exception:
+        return mol, False
+    if result is None or _skeleton(result) != _skeleton(mol):
+        return mol, False
+    # stereochemistry must survive: compare the stereo of the skeletons
+    if Chem.MolToSmiles(Chem.RemoveHs(result)).count("@") != Chem.MolToSmiles(Chem.RemoveHs(mol)).count("@"):
+        return mol, False
+    result, extra = _apply_extra_acids(result, ph)
+    changed = extra or Chem.MolToSmiles(result) != neutral
+    return result, changed
+
+
+def clean_molecule(mol, ionisation="ph", ph=DEFAULT_PH):
+    """Prepare a molecule's chemistry for docking: keep the largest fragment (drops salts and counter-ions), then set
+    its protonation state.
+
+    ionisation="ph":   assign the states at `ph` (carboxylic acids become anions, aliphatic amines cations, and so
+                       on), whatever charge state the file shows. This is what a docking run at physiological pH
+                       should use for a library of ordinary structures.
+    ionisation="keep": use the charges exactly as written in the file. For libraries that were already prepared at a
+                       given pH, where ionising again would undo that work.
 
     Returns (molecule, note) where note is "" or a sentence describing what was changed.
     """
@@ -125,14 +224,15 @@ def clean_molecule(mol):
     if len(fragments) > 1:
         mol = max(fragments, key=lambda m: m.GetNumHeavyAtoms())
         notes.append(f"kept the largest of {len(fragments)} fragments")
-    try:
-        neutral = rdMolStandardize.Uncharger().uncharge(mol)
-        if Chem.MolToSmiles(neutral) != Chem.MolToSmiles(mol):
-            notes.append("neutralised charges")
-        mol = neutral
-    except Exception:
-        pass
-    return mol, "; ".join(notes)
+    if ionisation == "keep":
+        return mol, "; ".join(notes)
+    # Open Babel is given the molecule as it is written. It moves protons to match the pH, so a group that is already
+    # in the right state stays, and a wrongly drawn one is corrected. Neutralising first would turn, for example, a
+    # sulfonate into a sulfonic acid whose rule Open Babel then misses.
+    ionised, changed = ionise(mol, ph)
+    if changed:
+        notes.append(f"ionised for pH {ph:g}")
+    return ionised, "; ".join(notes)
 
 
 def ligand_name(mol, index):
@@ -153,11 +253,23 @@ def iter_ligands(path):
 
     RDLogger.DisableLog("rdApp.*")
     if path.lower().endswith(".sdf"):
-        for i, mol in enumerate(Chem.SDMolSupplier(path)):
-            if mol is None:
-                yield i, f"molecule_{i + 1}", None, "RDKit could not read this molecule"
-            else:
-                yield i, ligand_name(mol, i), mol, ""
+        # The file is split at "$$$$" here and each record parsed on its own. RDKit's SDMolSupplier loses its place
+        # after a malformed record and also discards the good molecule that follows it, which would shift every later
+        # index (and make the count differ from count_ligands).
+        record = []
+        index = 0
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                if line.startswith("$$$$"):
+                    mol = Chem.MolFromMolBlock("".join(record), removeHs=False) if "".join(record).strip() else None
+                    if mol is None:
+                        yield index, f"molecule_{index + 1}", None, "RDKit could not read this molecule"
+                    else:
+                        yield index, ligand_name(mol, index), mol, ""
+                    index += 1
+                    record = []
+                else:
+                    record.append(line)
         return
     index = 0
     with open(path, errors="replace") as fh:
@@ -245,12 +357,13 @@ def embed_ligand(mol, timeout=EMBED_TIMEOUT_SECONDS, seed=DEFAULT_SEED):
     return mol_h
 
 
-def ligand_to_pdbqt(mol, seed=DEFAULT_SEED):
+def ligand_to_pdbqt(mol, seed=DEFAULT_SEED, ionisation="ph", ph=DEFAULT_PH):
     """Clean, embed and convert one molecule. Returns (pdbqt_text, note, cleaned_smiles)."""
     from meeko import MoleculePreparation, PDBQTWriterLegacy
-    from rdkit import Chem
+    from rdkit import Chem, RDLogger
 
-    mol, note = clean_molecule(mol)
+    RDLogger.DisableLog("rdApp.*")        # importing Meeko turns RDKit's log back on; its messages are harmless
+    mol, note = clean_molecule(mol, ionisation, ph)
     cleaned_smiles = Chem.MolToSmiles(Chem.RemoveHs(mol))
     mol_h = embed_ligand(mol, seed=seed)
     try:
@@ -270,25 +383,31 @@ def ligand_to_pdbqt(mol, seed=DEFAULT_SEED):
 
 def check_ligand(name, mol, program):
     """Quick checks done before the job starts. Returns (usable, problems) where problems are plain-language
-    sentences. A ligand with problems is still reported by the job, but will fail there."""
+    sentences. A ligand with problems is still reported by the job, but will fail there.
+
+    The checks look at the largest fragment, because that is the part the job docks: the sodium of a sodium salt is
+    removed, so it must not make the molecule unusable.
+    """
+    from rdkit import Chem
+
     problems = []
     if mol is None:
         return False, ["could not be read"]
-    elements = blocked_elements(mol, program)
+    fragments = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=False)
+    docked = max(fragments, key=lambda m: m.GetNumHeavyAtoms()) if len(fragments) > 1 else mol
+    elements = blocked_elements(docked, program)
     if elements:
         problems.append(f"contains {', '.join(elements)}, which {PROGRAMS[program]['title']} cannot read")
-    untyped = [e for e in untyped_elements(mol) if e not in elements]
+    untyped = [e for e in untyped_elements(docked) if e not in elements]
     if untyped:
         problems.append(f"contains {', '.join(untyped)}, which has no AutoDock atom type (metal complexes and "
                         "organometallics cannot be docked)")
-    heavy = mol.GetNumHeavyAtoms()
+    heavy = docked.GetNumHeavyAtoms()
     if heavy < 3:
         problems.append(f"has only {heavy} heavy atom(s)")
     elif heavy > 80:
         problems.append(f"has {heavy} heavy atoms; docking such a large molecule is unreliable")
-    from rdkit import Chem
-
-    if len(Chem.GetMolFrags(mol)) > 1:
+    if len(fragments) > 1:
         problems.append("has several fragments (salt?); only the largest is docked")
     return not any(p.startswith(("contains", "could not", "has only")) for p in problems), problems
 
@@ -354,6 +473,12 @@ def nnscore2_pkd(receptor, poses_pdbqt):
     return values
 
 
+def _worker_start():
+    """Workers are forked from the engine, which turns SIGTERM into KeyboardInterrupt. A worker stopped that way
+    prints a long traceback, so give workers the default behaviour: they just end."""
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+
 def dock_one(job):
     """Prepare, dock and (optionally) re-score one ligand. Runs in a worker process; never raises.
 
@@ -372,7 +497,7 @@ def dock_one(job):
         os.makedirs(folder, exist_ok=True)
         mol = Chem.Mol(job["mol"])        # binary form: keeps stereochemistry that a molblock without coordinates loses
         row["smiles"] = Chem.MolToSmiles(Chem.RemoveHs(mol))
-        cleaned = clean_molecule(mol)[0]
+        cleaned = clean_molecule(mol, job["ionisation"], job["ph"])[0]
         blocked = blocked_elements(cleaned, job["program"])
         if blocked:
             raise LigandError(f"contains {', '.join(blocked)}, which {PROGRAMS[job['program']]['title']} cannot read")
@@ -380,7 +505,7 @@ def dock_one(job):
         if untyped:
             raise LigandError(f"contains {', '.join(untyped)}, which has no AutoDock atom type (metal complexes and "
                               "organometallics cannot be docked)")
-        pdbqt, clean_note, row["smiles"] = ligand_to_pdbqt(mol, job["seed"])   # the SMILES that was docked
+        pdbqt, clean_note, row["smiles"] = ligand_to_pdbqt(mol, job["seed"], job["ionisation"], job["ph"])   # the SMILES that was docked
         ligand_file = os.path.join(folder, "ligand.pdbqt")
         with open(ligand_file, "w") as fh:
             fh.write(pdbqt)
@@ -469,14 +594,16 @@ def run_signature(args):
     return {"receptor": file_digest(args.receptor), "ligands": file_digest(args.ligands), "program": args.program,
             "center": [round(c, 3) for c in args.center], "size": [round(c, 3) for c in args.size],
             "exhaustiveness": args.exhaustiveness, "num_modes": args.num_modes, "seed": args.seed,
-            "rescore": args.rescore or "", "add_hydrogens": bool(args.add_hydrogens)}
+            "rescore": args.rescore or "", "add_hydrogens": bool(args.add_hydrogens),
+            "ionisation": args.ionisation, "ph": args.ph if args.ionisation == "ph" else None}
 
 
 def signature_differences(old, new):
     names = {"receptor": "the receptor", "ligands": "the ligand file", "program": "the docking program",
              "center": "the box centre", "size": "the box size", "exhaustiveness": "the exhaustiveness",
              "num_modes": "the number of poses", "seed": "the random seed", "rescore": "the re-scoring",
-             "add_hydrogens": "the hydrogen setting"}
+             "add_hydrogens": "the hydrogen setting", "ionisation": "the ionisation setting",
+             "ph": "the ligand pH"}
     return [names[k] for k in names if old.get(k) != new.get(k)]
 
 
@@ -582,6 +709,9 @@ def build_parser():
     parser.add_argument("--num_modes", type=int, default=DEFAULT_NUM_MODES, help="poses kept per ligand")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--rescore", choices=["nnscore2"], default=None, help="re-score the poses with NNScore2")
+    parser.add_argument("--ionisation", choices=IONISATION_MODES, default="ph",
+                        help="ph: assign protonation states at --ph (default); keep: use the charges in the file")
+    parser.add_argument("--ph", type=float, default=DEFAULT_PH, help="pH for --ionisation ph (default 7.4)")
     parser.add_argument("--cpus", type=int, default=0, help="ligands docked at the same time (default: all CPUs the "
                                                             "job may use)")
     parser.add_argument("--adfr_path", default=DEFAULT_ADFR_PATH)
@@ -619,6 +749,8 @@ def validate_args(args):
             problems.append(f"--{flag}: file not found: {path}")
     if args.resume and args.force:
         problems.append("--resume and --force cannot be combined")
+    if not 0.0 <= args.ph <= 14.0:
+        problems.append("--ph must be between 0 and 14")
     return problems
 
 
@@ -696,7 +828,8 @@ def main(argv=None):
             yield {"index": index, "name": name, "mol": mol.ToBinary(), "folder": ligand_folder(args.outdir, index),
                    "program": args.program, "receptor": receptor_pdbqt,
                    "box": {"center": args.center, "size": args.size}, "exhaustiveness": args.exhaustiveness,
-                   "num_modes": args.num_modes, "seed": args.seed, "rescore": args.rescore, "clean": args.clean}
+                   "num_modes": args.num_modes, "seed": args.seed, "rescore": args.rescore, "clean": args.clean,
+                   "ionisation": args.ionisation, "ph": args.ph}
 
     def record(row):
         final[row["index"]] = {k: row.get(k, "") for k in RESULT_COLUMNS}
@@ -709,7 +842,7 @@ def main(argv=None):
     todo = total - len(final)
     done, started, last_report = 0, time.time(), time.time()
     broken = False
-    pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers)
+    pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=_worker_start)
     pending = {}                                    # future -> (index, name); never more than a few per worker
     stream = jobs()
     window = workers * 4
@@ -735,10 +868,15 @@ def main(argv=None):
                 index, name = pending.pop(future)
                 try:
                     row = future.result()
-                except Exception as exc:                  # a worker died (for example out of memory)
+                except concurrent.futures.BrokenExecutor:
+                    # A worker was killed (for example by the out-of-memory killer). Python then fails every queued
+                    # molecule, including ones that did nothing wrong, so these are NOT recorded as failures: they
+                    # are simply not done yet, and a resume docks them.
+                    broken = True
+                    continue
+                except Exception as exc:                  # an error in this molecule's own worker
                     row = {"index": index, "name": name, "status": "failed",
                            "note": f"worker stopped: {type(exc).__name__}: {exc}"}
-                    broken = broken or isinstance(exc, concurrent.futures.BrokenExecutor)
                 record(row)
                 done += 1
                 failed_now = row["status"] != "docked"
@@ -749,7 +887,8 @@ def main(argv=None):
                     eta = f", about {(todo - done) / rate / 60:.0f} min left" if done >= workers and todo > 200 else ""
                     print(f"[{done}/{todo}] {row['name']}: {shown}{eta}", flush=True)
                     last_report = now
-            if broken and not pending:
+            if broken:
+                pending.clear()                           # the rest cannot complete: stop at once
                 break
     except KeyboardInterrupt:
         pool.shutdown(wait=False, cancel_futures=True)
@@ -758,13 +897,23 @@ def main(argv=None):
         print(f"Stopped after {done} of {todo} molecule(s). Finished molecules are kept; run again with --resume.",
               file=sys.stderr, flush=True)
         return 130
+    if broken:
+        # Do not wait for the surviving workers: each may be minutes into docking a molecule whose result nobody
+        # will collect. Stop them, keep everything that finished, and say how to carry on.
+        pool.shutdown(wait=False, cancel_futures=True)
+        for process in multiprocessing.active_children():     # the pool forgets its workers once it is broken
+            try:
+                process.kill()
+            except Exception:
+                pass
+        journal.close()
+        write_results(args.outdir, final)
+        print(f"A worker process died (most likely killed for using too much memory), after {done} of {todo} "
+              "molecule(s). Finished molecules are kept; run again with --resume, with fewer CPUs or more memory.",
+              file=sys.stderr, flush=True)
+        return 1
     pool.shutdown(wait=True, cancel_futures=True)
     journal.close()
-    if broken:
-        write_results(args.outdir, final)
-        print("A worker process died (most likely out of memory). Finished molecules are kept; run again with "
-              "--resume, with fewer CPUs or more memory.", file=sys.stderr, flush=True)
-        return 1
 
     write_results(args.outdir, final)                  # sorted by input order, replacing the journal
     write_sdf_files(args.outdir, final)

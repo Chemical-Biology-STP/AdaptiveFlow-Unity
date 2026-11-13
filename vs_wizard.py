@@ -88,6 +88,8 @@ class Settings:
     num_modes: int = vs_dock.DEFAULT_NUM_MODES
     seed: int = vs_dock.DEFAULT_SEED
     rescore: object = None
+    ionisation: str = "ph"
+    ligand_ph: float = vs_dock.DEFAULT_PH
     clean: bool = False
     # how to run
     mode: str = "submit"
@@ -879,10 +881,30 @@ def step_ligands(s, cfg):
              "files are deleted as it goes, and a run may need several jobs (finished molecules are skipped when "
              "you resume).")
     if any("several fragments" in p for r in library.noted for p in r.problems):
-        note("Molecules with several fragments (salts) are reduced to their largest fragment, and simple charges "
-             "are neutralised, before docking.")
+        note("Molecules with several fragments (salts) are reduced to their largest fragment before docking.")
+    ask_ionisation(s, cfg)
     note("Stereocentres and tautomers are used as they are in your file; they are not enumerated. If a centre is "
          "undefined, one arbitrary form is docked. Rings of 7 or more atoms are kept rigid.")
+
+
+def ask_ionisation(s, cfg):
+    """How to treat the charge states of the molecules: set them for a pH, or use them as written."""
+    if cfg is not None:
+        settings = cfg["docking"]
+        s.ionisation = settings.get("ionisation", "ph")
+        s.ligand_ph = settings.get("ligand_ph", vs_dock.DEFAULT_PH)
+        return
+    say("\n  Charge states. Acids and amines are charged in water: at pH 7.4 a carboxylic acid is an anion and an")
+    say("  aliphatic amine a cation, and docking programs score hydrogen bonds differently for the two forms.")
+    s.ionisation = ask_menu([
+        ("ph", "Set each molecule's charge state for a pH (Open Babel rules). Use this for a library of ordinary "
+               "structures."),
+        ("keep", "Use the charges exactly as written in the file. Use this for a library that was already prepared "
+                 "at a given pH, for example from ZINC.")], 1)
+    if s.ionisation == "ph":
+        s.ligand_ph = ask_number("pH", s.ligand_ph, float, 0.0, True, 14.0)
+        note("The rules were right for 48 of 49 test molecules and 17 of 20 real drugs. They tend to charge every "
+             "aliphatic amine, including weak bases such as N-arylpiperazines.")
 
 
 # --------------------------------------------------------------------------
@@ -906,6 +928,8 @@ def step_settings(s, cfg):
     s.num_modes = settings.get("num_modes", vs_dock.DEFAULT_NUM_MODES)
     s.seed = settings.get("seed", vs_dock.DEFAULT_SEED)
     s.rescore = settings.get("rescore")
+    s.ionisation = settings.get("ionisation", "ph")
+    s.ligand_ph = settings.get("ligand_ph", vs_dock.DEFAULT_PH)
     if cfg is None:
         say("\n  Search effort per molecule (exhaustiveness) is "
             f"{s.exhaustiveness} by default: a good balance for screening. A bigger number searches more")
@@ -934,8 +958,8 @@ def step_settings(s, cfg):
 # Files the job needs, and the engine's command line
 # --------------------------------------------------------------------------
 
-MB_PER_LIGAND = 0.04             # a ligand's folder with all intermediates (measured: about 40 KB)
-MB_PER_LIGAND_CLEAN = 0.02       # with --clean: only poses.sdf stays
+MB_PER_LIGAND = 0.115            # the figure below plus about 40 KB of intermediates per ligand (that part not re-measured)
+MB_PER_LIGAND_CLEAN = 0.075      # with --clean, measured on 2,000 Enamine molecules: 151 MB in all, all files together
 
 
 def input_paths(s):
@@ -967,6 +991,9 @@ def engine_args(s, final=False):
             "--seed", str(s.seed)]
     if s.rescore:
         args += ["--rescore", s.rescore]
+    args += ["--ionisation", s.ionisation]
+    if s.ionisation == "ph":
+        args += ["--ph", f"{s.ligand_ph:g}"]
     for flag, on in (("--add_hydrogens", s.add_hydrogens), ("--clean", s.clean), ("--resume", s.resume),
                      ("--force", s.force and not s.resume)):
         if on:
@@ -1234,6 +1261,8 @@ def step_review(s, confirm=True):
             ("Molecules", f"{s.n_kept:,} of {s.library.total:,} in {s.ligands} ({names})"),
             ("Program", f"{vs_dock.PROGRAMS[s.program]['title']}, exhaustiveness {s.exhaustiveness}, "
                         f"{s.num_modes} poses per molecule, seed {s.seed}")]
+    rows.append(("Charge states", f"set for pH {s.ligand_ph:g} (Open Babel rules)" if s.ionisation == "ph"
+                  else "as written in the molecule file"))
     if s.rescore:
         rows.append(("Re-scoring", "NNScore2 (predicted pKd per pose)"))
     if s.protonated is not None:
@@ -1307,7 +1336,8 @@ def run_file_values(s):
             values["ph"] = s.protonated.ph
     values["flagged_ligands"] = s.flagged_choice
     values["docking"] = {"program": s.program, "exhaustiveness": s.exhaustiveness, "num_modes": s.num_modes,
-                         "seed": s.seed, "box_size": s.box_size, "rescore": s.rescore or "none"}
+                         "seed": s.seed, "box_size": s.box_size, "rescore": s.rescore or "none",
+                         "ionisation": s.ionisation, "ligand_ph": s.ligand_ph if s.ionisation == "ph" else None}
     run = {"mode": s.mode, "job_name": s.jobname, "cpus": s.cpus}
     if s.mode != "run":
         run.update(time=s.time_limit, partition=s.partition)
