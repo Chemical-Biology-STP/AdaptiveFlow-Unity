@@ -2,13 +2,14 @@
 channels = ["conda-forge", "https://conda.anaconda.org/hcc"]
 name = "virtual_screening"
 platforms = ["linux-64"]
-version = "0.2.0"
+version = "0.3.0"
 
 [tasks]
 vs = "python vs_cli.py"
-# Fast tests (331 tests, about 15 seconds). `pixi run test-all` also runs the 36 that dock with the real programs (about 7 more minutes).
-test = "pytest test -q -m 'not slow'"
-test-all = "pytest test -q"
+# Fast tests (638 tests, about 20 seconds). `pixi run test-all` also runs the 36 that dock with the real programs (about 7 more minutes). `pixi run test-cluster` submits a real staged run to SLURM, three of them (about 1.5 minutes each with a free queue).
+test = "pytest test -q -m 'not slow and not cluster'"
+test-all = "pytest test -q -m 'not cluster'"
+test-cluster = "pytest test -q -m cluster"   # needs VS_CLUSTER_TEST_DIR=<a folder on shared storage>
 
 [dependencies]
 python = ">=3.11"
@@ -23,6 +24,11 @@ pdb2pqr = ">=3.8.0,<4"
 propka = ">=3.5.1,<4"
 pyyaml = ">=6.0.3,<7"
 pytest = ">=9.2.0,<10"
+boto3 = ">=1.43.127,<2"
+pandas = ">=3.1.1,<4"
+pyarrow = ">=26.0.1,<27"
+jinja2 = ">=3.1.6,<4"
+jq = ">=1.8.2,<2"
 
 # ADFRsuite (prepare_receptor) ships its own Python 2.7 and overwrites `python` in the environment's bin/,
 # so it lives in a separate environment. Install it with `pixi install --all`.
@@ -31,3 +37,6 @@ adfr-suite = ">=1.0,<2"
 
 [environments]
 adfr = { features = ["adfr"], no-default-feature = true }
+
+[pypi-dependencies]
+func-timeout = ">=4.3.5, <5"

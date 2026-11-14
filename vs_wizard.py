@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 import vs_dock
 import vs_runfile
 import vs_slurm
+import vs_staged
 from vs_ui import (WARNINGS, ask, ask_menu, ask_number, ask_yes_no, bold, dim, fail, file_validator, fmt_minutes,
                    heading, note, ok, path_completer, red, say, table, time_to_minutes, time_validator, warn, yellow)
 
@@ -36,6 +37,7 @@ LARGE_BOX = 40.0                 # above this, Vina-family programs need more se
 MAX_BOX = 126.0
 BOX_MARGIN = 10.0                # box edge = size of the reference ligand + this
 BOX_FAR_FROM_PROTEIN = 8.0       # a box centre this far from every protein atom is suspicious
+TRANCHE_SUGGESTED_FROM = 1_000_000   # from this many molecules the tranche strategy is the suggested choice
 BIG_LIBRARY = 20000              # above this many molecules, warn about the number of files and the run time
 MAX_LIGAND_HEAVY = 80
 DEFAULT_CPUS = vs_slurm.MAX_CPUS_DEFAULT
@@ -91,6 +93,17 @@ class Settings:
     ionisation: str = "ph"
     ligand_ph: float = vs_dock.DEFAULT_PH
     clean: bool = False
+    # staged screening (AdaptiveFlow)
+    screen: str = "full"           # "full" (dock every molecule) or "staged"
+    max_stereoisomers: int = 1
+    max_tautomers: int = 1
+    strategy: str = "all"          # "all" (dock every form) or "tranche" (prescreen tranches, dock the best)
+    representatives: int = vs_staged.DEFAULT_REPRESENTATIVES
+    primary_size: int = 0
+    ml_filter: bool = False
+    ml_cutoff: float = vs_staged.DEFAULT_ML_CUTOFF
+    tranche_properties: list = field(default_factory=lambda: list(vs_staged.DEFAULT_TRANCHE_PROPERTIES))
+    estimate: object = None        # vs_staged.estimate_prescreen() result for the tranche strategy
     # how to run
     mode: str = "submit"
     rundir: str = ""
@@ -876,12 +889,15 @@ def step_ligands(s, cfg):
             say(f"  All {library.total:,} molecule(s) will be docked.")
     s.remaining = s.n_kept
     s.clean = s.n_kept >= 500
-    if s.n_kept > BIG_LIBRARY:
+    if s.n_kept > BIG_LIBRARY and s.screen != "staged":
         warn(f"{s.n_kept:,} molecules is a large library: the job writes a folder per molecule, so intermediate "
              "files are deleted as it goes, and a run may need several jobs (finished molecules are skipped when "
              "you resume).")
     if any("several fragments" in p for r in library.noted for p in r.problems):
         note("Molecules with several fragments (salts) are reduced to their largest fragment before docking.")
+    if s.screen == "staged":
+        note("The molecules are prepared by AFLP (forms, protonation, 3D); the settings are the ones chosen in step 2.")
+        return
     ask_ionisation(s, cfg)
     note("Stereocentres and tautomers are used as they are in your file; they are not enumerated. If a centre is "
          "undefined, one arbitrary form is docked. Rings of 7 or more atoms are kept rigid.")
@@ -1248,6 +1264,8 @@ def ensure_partition_access(s, cfg):
 
 
 def step_review(s, confirm=True):
+    if s.screen == "staged":
+        return step_review_staged(s, confirm)
     heading(5, TOTAL_STEPS, "Review")
     names = ", ".join(s.first_names) + (" ..." if s.n_kept > len(s.first_names) else "")
     if s.prepared is not None:
@@ -1342,6 +1360,21 @@ def run_file_values(s):
     if s.mode != "run":
         run.update(time=s.time_limit, partition=s.partition)
     values["run"] = run
+    if s.screen == "staged":
+        values["screen"] = "staged"
+        values.pop("existing_output", None)
+        values["docking"] = {"program": s.program, "exhaustiveness": s.exhaustiveness, "seed": s.seed,
+                             "box_size": s.box_size, "ligand_ph": s.ligand_ph}
+        tranche = s.strategy == "tranche"
+        values["staged"] = {"strategy": "tranche" if tranche else None,
+                            "representatives": s.representatives if tranche else None,
+                            "primary_size": s.primary_size if tranche else None,
+                            "tranche_properties": list(s.tranche_properties) if tranche else None,
+                            "ml_filter": True if tranche and s.ml_filter else None,
+                            "ml_cutoff": s.ml_cutoff if tranche and s.ml_filter else None,
+                            "max_stereoisomers": s.max_stereoisomers, "max_tautomers": s.max_tautomers}
+        values["staged"] = {k: v for k, v in values["staged"].items() if v is not None}
+        values["run"] = {"mode": s.mode, "job_name": s.jobname, "cpus": s.cpus, "partition": s.partition}
     return values
 
 
@@ -1356,7 +1389,10 @@ def write_run_file(s):
         warn(f"Could not save the run file: {exc}", record=False)
         return None
     ok(f"Run file saved: {path}")
-    note(f"Repeat this run, or change a value and run it again, with:  {RUN_COMMAND} {path}")
+    if s.screen == "staged":
+        note(f"A template for another staged run (change 'output' to a new folder first):  {RUN_COMMAND} {path}")
+    else:
+        note(f"Repeat this run, or change a value and run it again, with:  {RUN_COMMAND} {path}")
     return path
 
 
@@ -1413,8 +1449,318 @@ def run_here(s):
         return None
 
 
+# --------------------------------------------------------------------------
+# Staged screening (AdaptiveFlow): settings, how to run, review, start
+# --------------------------------------------------------------------------
+
+
+def step_staged_settings(s, cfg):
+    heading(2, TOTAL_STEPS, "Docking and preparation settings")
+    settings = {} if cfg is None else cfg["docking"]
+    staged = {} if cfg is None else cfg["staged"]
+    if cfg is None:
+        say("  Which docking program?\n")
+        options = [(p, f"{p:<17} {vs_dock.PROGRAMS[p]['title']:<22} {vs_dock.PROGRAMS[p]['text']}")
+                   for p in PROGRAM_ORDER]
+        s.program = ask_menu(options, 1)
+    else:
+        s.program = settings.get("program", vs_dock.DEFAULT_PROGRAM)
+    s.exhaustiveness = settings.get("exhaustiveness", vs_dock.DEFAULT_EXHAUSTIVENESS)
+    s.seed = settings.get("seed", vs_dock.DEFAULT_SEED)
+    s.ligand_ph = settings.get("ligand_ph", vs_dock.DEFAULT_PH)
+    s.max_stereoisomers = staged.get("max_stereoisomers", 1)
+    s.max_tautomers = staged.get("max_tautomers", 1)
+    if s.box_size > LARGE_BOX and "exhaustiveness" not in settings:
+        s.exhaustiveness = max(s.exhaustiveness, 16)
+        note(f"The box is large ({s.box_size:g} A), so the exhaustiveness is raised to {s.exhaustiveness}.")
+    if cfg is None:
+        say("\n  AdaptiveFlow's AFLP prepares every molecule (protonation at a pH, 3D coordinates) and can prepare")
+        say("  several forms of it: stereoisomers and tautomers. Every form is docked and the best score counts, so")
+        say("  each extra form costs as much docking time as another molecule. Defaults: one form (the molecule as")
+        say(f"  drawn), pH {s.ligand_ph:g}, search effort {s.exhaustiveness}.")
+        if ask_yes_no("Change the forms prepared per molecule, the pH, or the search effort?", False):
+            s.max_stereoisomers = ask_number("Stereoisomers per molecule (1 = as drawn)", s.max_stereoisomers, int, 1,
+                                             True, 20)
+            s.max_tautomers = ask_number("Tautomers per molecule (1 = as drawn)", s.max_tautomers, int, 1, True, 20)
+            s.ligand_ph = ask_number("pH for the molecules", s.ligand_ph, float, 0.0, True, 14.0)
+            s.exhaustiveness = ask_number("Exhaustiveness", s.exhaustiveness, int, 1, True, 128)
+    forms = vs_staged.forms_per_molecule(s.max_stereoisomers, s.max_tautomers)
+    say(f"\n  {vs_dock.PROGRAMS[s.program]['title']}, exhaustiveness {s.exhaustiveness}, box {s.box_size:g} A, "
+        f"pH {s.ligand_ph:g}. About {vs_staged.seconds_per_form(s.program, s.exhaustiveness):.0f} s of one CPU per "
+        f"form; {'one form' if forms == 1 else f'about {forms:.1f} forms'} per molecule.")
+    if forms > 1:
+        warn(f"Preparing up to {s.max_stereoisomers} stereoisomer(s) and {s.max_tautomers} tautomer(s) per molecule "
+             f"multiplies the docking cost by up to {forms:.1f} (an estimate: only 5 and 5, about 4.6 forms, was "
+             "measured).")
+
+
+def tranche_names_validator(text):
+    names = text.replace(",", " ").split() if isinstance(text, str) else list(text)
+    unknown = [n for n in names if n not in vs_staged.TRANCHE_PROPERTY_NAMES]
+    if not names or unknown or len(set(names)) != len(names):
+        raise ValueError("Give different names from: " + ", ".join(vs_staged.TRANCHE_PROPERTY_NAMES)
+                         + (f" (not understood: {', '.join(unknown)})" if unknown else ""))
+    return names
+
+
+def step_staged_strategy(s, cfg, staged):
+    """Which forms are docked: all of them, or the tranche strategy of AdaptiveFlow."""
+    s.strategy = staged.get("strategy", "all")
+    s.representatives = staged.get("representatives", vs_staged.DEFAULT_REPRESENTATIVES)
+    s.tranche_properties = list(staged.get("tranche_properties") or vs_staged.DEFAULT_TRANCHE_PROPERTIES)
+    s.primary_size = min(s.n_kept, staged.get("primary_size") or max(1, round(s.n_kept * vs_staged.DEFAULT_PRIMARY_FRACTION)))
+    s.ml_filter = bool(staged.get("ml_filter", False))
+    s.ml_cutoff = staged.get("ml_cutoff", vs_staged.DEFAULT_ML_CUTOFF)
+    if cfg is None:
+        say("\n  Which forms are docked?\n")
+        s.strategy = ask_menu([
+            ("all", "Every form of every molecule. The most complete; the cost grows with the library."),
+            ("tranche", "Tranche strategy (AdaptiveFlow): group the molecules into tranches by properties, dock a few "
+                        "of each tranche, then dock only the tranches that scored best. Much cheaper for big "
+                        "libraries; it finds most, not all, of the best molecules.")],
+            2 if s.n_kept >= TRANCHE_SUGGESTED_FROM else 1)
+        if s.strategy == "tranche":
+            s.representatives = ask_number(f"Forms docked per tranche in the prescreen (1 to "
+                                           f"{vs_staged.MAX_REPRESENTATIVES})", s.representatives, int, 1, True,
+                                           vs_staged.MAX_REPRESENTATIVES)
+            s.primary_size = ask_number("Molecules docked in the primary screen", s.primary_size, int, 1, True)
+            s.primary_size = min(s.primary_size, s.n_kept)
+            say("\n  A neural network can look at the molecules of the selected tranches before they are docked. It is")
+            say("  trained on the prescreen scores and drops the molecules it predicts to dock badly, so fewer are")
+            say("  docked; the size above then becomes the pool it looks at, so choose a bigger one than without the")
+            say("  filter (2 to 3 times). In a test on 3,000 molecules, filtering a pool of 65% of the library docked")
+            say("  42% and found 28 of the best 30; the tranches alone found 23 at 39% and 26 at 50%. It is skipped, and")
+            say("  everything in the pool is docked, when the prescreen is too small to train it or the model is hardly")
+            say("  better than chance.")
+            s.ml_filter = ask_yes_no("Use the neural-network filter?", s.n_kept >= TRANCHE_SUGGESTED_FROM)
+            if s.ml_filter and ask_yes_no(f"Change the cutoff (now {s.ml_cutoff:g}; a higher one drops more)?", False):
+                s.ml_cutoff = ask_number("Cutoff", s.ml_cutoff, float, 0.05, True, 0.95)
+            say(f"\n  Tranches are defined by: {', '.join(s.tranche_properties)}.")
+            if ask_yes_no("Change the properties that define the tranches?", False):
+                s.tranche_properties = ask("Properties (names separated by spaces)", " ".join(s.tranche_properties),
+                                           tranche_names_validator)
+    if s.strategy != "tranche":
+        s.estimate = None
+        return
+    say("\n  Sampling the library to estimate the prescreen ...")
+    forms = vs_staged.forms_per_molecule(s.max_stereoisomers, s.max_tautomers)
+    s.estimate = vs_staged.estimate_prescreen(staged_ligands(s), s.n_kept, forms, s.tranche_properties,
+                                              s.representatives)
+    e = s.estimate
+    say(f"  About {e['tranches']:,} tranches ({'counted' if e['exact'] else 'estimated from a sample of ' + format(e['sample'], ',')}); "
+        f"the prescreen docks about {e['prescreen_forms']:,} forms, then the best tranches up to {s.primary_size:,} "
+        "molecules.")
+    if e["tranches"] > 0.5 * s.n_kept:
+        warn("There are almost as many tranches as molecules, so the prescreen would dock nearly everything. Choose "
+             "fewer properties, or dock every form.")
+    elif e["tranches"] < 10:
+        warn("There are very few tranches, so the prescreen cannot tell the molecules apart. Choose more properties.")
+    warn("The tranche strategy docks a fraction of the library and misses some of the best molecules. In tests on 3,000 "
+         "molecules, docking 30% of them found about 25 of the best 30 and 73 of the best 100 (a random 30% would find "
+         "9 and 30).")
+
+
+def hours_text(hours):
+    return f"{hours:,.1f}" if hours < 10 else f"{hours:,.0f}"
+
+
+def staged_sizes(s, cpus=None):
+    tranche = s.strategy == "tranche"
+    return vs_staged.plan_sizes(s.n_kept, s.program, s.exhaustiveness, s.max_stereoisomers, s.max_tautomers,
+                                cpus or s.cpus, s.strategy, s.primary_size if tranche else None,
+                                s.estimate["prescreen_forms"] if tranche and s.estimate else None,
+                                tranche and s.ml_filter)
+
+
+def suggest_staged_cpus(s, limit):
+    """Enough CPUs to finish in about a day, between one subjob and the suggested maximum."""
+    probe = staged_sizes(s, vs_staged.SUGGESTED_CPUS)
+    wanted = math.ceil(probe["cpu_hours"] / 24 / vs_staged.SUBJOB_CPUS) * vs_staged.SUBJOB_CPUS
+    return int(min(limit, vs_staged.SUGGESTED_CPUS, max(vs_staged.SUBJOB_CPUS, wanted)))
+
+
+def step_staged_run(s, cfg):
+    heading(4, TOTAL_STEPS, "Strategy and how to run it")
+    run = {} if cfg is None else cfg["run"]
+    step_staged_strategy(s, cfg, {} if cfg is None else cfg["staged"])
+    has_slurm = shutil.which("sbatch") is not None
+    s.jobname = run.get("job_name") or default_jobname(s.ligands)
+    if cfg is None:
+        options = []
+        if has_slurm:
+            options.append(("submit", "Submit to the cluster queue (SLURM). The stages follow each other by themselves."))
+        options.append(("save", "Only prepare the run folder; start it later with `advance`"))
+        if not has_slurm:
+            warn("SLURM (sbatch) was not found on this computer, so cluster submission is unavailable.")
+        say("  The staged screen runs on the cluster: preparation (AFLP), "
+            + ("a prescreen of the tranches, " if s.strategy == "tranche" else "") + "docking (AFVS), then the ranking.")
+        s.mode = ask_menu(options, 1)
+    else:
+        s.mode = run["mode"]
+        if s.mode == "submit" and not has_slurm:
+            raise Stop("run.mode is 'submit', but SLURM (sbatch) was not found on this computer. Use 'save'.")
+
+    default_dir = os.path.join(os.getcwd(), s.jobname)
+    while True:
+        path = ask("Run folder", default_dir, lambda t: os.path.abspath(os.path.expanduser(t.strip("'\""))))\
+            if cfg is None else cfg["output"]
+        problem = validate_rundir(path)
+        if not problem and os.path.isdir(path) and os.listdir(path):
+            problem = ("That folder is not empty. A staged run needs a new folder (an earlier run is continued with "
+                       f"`{RUN_COMMAND} advance <folder>`).")
+        if problem:
+            if cfg is not None:
+                raise Stop(f"'output' {path}: {problem}")
+            fail(problem)
+            default_dir = path.rstrip("/") + "_new"
+            continue
+        s.rundir, s.outdir = path, os.path.join(path, "results")
+        break
+    s.resume, s.force = False, False
+    if cfg is None:
+        s.jobname = ask("Job name", s.jobname, lambda t: re.sub(r"[^A-Za-z0-9_.-]", "_", t))
+
+    limit = vs_staged.cluster_cpu_limit(s.partition)
+    suggested = run.get("cpus") or suggest_staged_cpus(s, limit)
+    if cfg is None:
+        say(f"\n  CPUs working at the same time. The cluster lets one user run up to {limit:,}; "
+            f"{vs_staged.SUGGESTED_CPUS} is the suggestion. Jobs of {vs_staged.SUBJOB_CPUS} CPUs are queued, so "
+            "the number is used in steps of that size.")
+        s.cpus = ask_number("CPUs", suggested, int, 1, True, limit)
+    else:
+        s.cpus = suggested
+        if s.cpus > limit:
+            raise Stop(f"run.cpus is {s.cpus}, but one user may use at most {limit} CPUs in this partition.")
+    s.partition = run.get("partition", vs_slurm.DEFAULT_PARTITION)
+    if cfg is None and ask_yes_no("Change the partition?", False):
+        s.partition = ask("Partition", s.partition)
+    sizes = staged_sizes(s)
+    used = sizes["subjobs_at_once"] * sizes["subjob_cpus"]
+    docked = (f", of which about {sizes['dock_forms']:,} are docked" if s.strategy == "tranche" else "")
+    say(f"\n  {s.n_kept:,} molecule(s), about {sizes['n_forms']:,} form(s){docked}: roughly {hours_text(sizes['cpu_hours'])} CPU-hours "
+        f"({hours_text(sizes['prep_cpu_hours'])} preparing, {hours_text(sizes['dock_cpu_hours'])} docking). With {used:,} CPUs working "
+        f"at once that is about {fmt_minutes(sizes['wall_hours'] * 60)} plus waiting in the queue.")
+    if s.cpus > vs_staged.CONFIRM_CPUS or sizes["cpu_hours"] > vs_staged.CONFIRM_CPU_HOURS:
+        warn(f"This is a large request ({s.cpus:,} CPUs, {sizes['cpu_hours']:,.0f} CPU-hours). Other users share the "
+             "cluster; check that it is meant.")
+        if cfg is None and not ask_yes_no("Go on with this size?", False):
+            raise KeyboardInterrupt
+    if sizes["gb"] > 50:
+        warn(f"The run needs about {sizes['gb']:,.0f} GB of disk space.")
+    free = shutil.disk_usage(os.path.dirname(s.rundir) if os.path.isdir(os.path.dirname(s.rundir)) else os.getcwd()).free
+    if sizes["gb"] * 1e9 > free:
+        warn(f"The run may need about {sizes['gb']:.1f} GB but only {free / 1e9:.1f} GB is free where it will be written.")
+    if s.mode != "save" and has_slurm:
+        probe_cpus, probe_time = s.cpus, s.time_limit
+        s.cpus, s.time_limit = sizes["subjob_cpus"], "1:00:00"
+        try:
+            ensure_partition_access(s, cfg)
+        finally:
+            s.cpus, s.time_limit = probe_cpus, probe_time
+    if cfg is not None:
+        say(f"  {s.mode.capitalize()}: {used:,} CPUs at once, partition {s.partition}. Run folder {s.rundir}.")
+
+
+def step_review_staged(s, confirm=True):
+    heading(5, TOTAL_STEPS, "Review")
+    names = ", ".join(s.first_names) + (" ..." if s.n_kept > len(s.first_names) else "")
+    if s.prepared is not None:
+        protein = f"{s.structure_path} (chains {', '.join(s.prepared.kept_chains)}, cleaned)"
+        site = f"centred on {s.template_label}: {s.center[0]:.2f} {s.center[1]:.2f} {s.center[2]:.2f}"
+    else:
+        protein = s.original_receptor or s.receptor
+        what = "reference ligand " + os.path.basename(s.reference_ligand) if s.reference_ligand else "given centre"
+        site = f"{what}: {s.center[0]:.2f} {s.center[1]:.2f} {s.center[2]:.2f}"
+    sizes = staged_sizes(s)
+    used = sizes["subjobs_at_once"] * sizes["subjob_cpus"]
+    forms = ("one form per molecule" if sizes["forms_per_molecule"] == 1 else
+             f"up to {s.max_stereoisomers} stereoisomer(s) and {s.max_tautomers} tautomer(s) per molecule "
+             f"(about {sizes['forms_per_molecule']:.1f} forms)")
+    strategy = ("every form is docked" if s.strategy == "all" else
+                f"tranches ({', '.join(s.tranche_properties)}): {s.representatives} form(s) per tranche in the prescreen "
+                f"(about {s.estimate['prescreen_forms']:,}), then the best tranches up to {s.primary_size:,} molecules"
+                + (f", of which a neural network keeps those with a predicted probability of at least {s.ml_cutoff:g}"
+                   if s.ml_filter else ""))
+    rows = [("Screen", "staged, with AdaptiveFlow (AFLP prepares, AFVS docks); scores only, no poses"),
+            ("Strategy", strategy),
+            ("Protein", protein), ("Binding site", site), ("Search box", f"{s.box_size:g} A edge"),
+            ("Molecules", f"{s.n_kept:,} of {s.library.total:,} in {s.ligands} ({names})"),
+            ("Program", f"{vs_dock.PROGRAMS[s.program]['title']}, exhaustiveness {s.exhaustiveness}, seed {s.seed}"),
+            ("Preparation", f"{forms}, protonated at pH {s.ligand_ph:g}")]
+    if s.protonated is not None:
+        rows.append(("Protonation", f"PDB2PQR + PROPKA at pH {s.protonated.ph:g} ({s.protonated.hydrogens} hydrogens)"))
+    elif s.add_hydrogens:
+        rows.append(("Hydrogens", "added to the receptor by ADFR (quick rule-based guess)"))
+    rows += [("Run folder", s.rundir),
+             ("Partition / CPUs", f"{s.partition} / {used:,} at once in jobs of {sizes['subjob_cpus']} "
+                                  f"({vs_slurm.MEM_PER_CPU} each)"),
+             ("Estimate", f"{hours_text(sizes['cpu_hours'])} CPU-hours, about {fmt_minutes(sizes['wall_hours'] * 60)} with "
+                          f"these CPUs plus queueing; {sizes['dock_subjobs']:,} docking jobs; about "
+                          f"{sizes['gb']:,.1f} GB of output"),
+             ("Job name", s.jobname),
+             ("Action", {"submit": "Submit the first stage to the queue", "save": "Prepare the run folder"}[s.mode])]
+    table(rows, indent="  ")
+    if WARNINGS:
+        say(f"\n  {yellow('Warnings to consider:')}")
+        for w in dict.fromkeys(WARNINGS):
+            say(f"   - {w}")
+    say("")
+    if not confirm:
+        return True
+    return ask_yes_no(f"{rows[-1][1]}?", True)
+
+
+def staged_plan(s):
+    return {"run_dir": s.rundir, "receptor": s.receptor, "add_hydrogens": s.add_hydrogens, "center": list(s.center),
+            "box_size": s.box_size, "ligands": staged_ligands(s), "program": s.program,
+            "exhaustiveness": s.exhaustiveness, "seed": s.seed, "ph": s.ligand_ph,
+            "max_stereoisomers": s.max_stereoisomers, "max_tautomers": s.max_tautomers, "cpus": s.cpus,
+            "partition": s.partition, "job_name": s.jobname, "strategy": s.strategy,
+            **({"representatives": s.representatives, "primary_size": s.primary_size,
+                "tranche_properties": list(s.tranche_properties), "ml_filter": s.ml_filter,
+                **({"ml_cutoff": s.ml_cutoff} if s.ml_filter else {})} if s.strategy == "tranche" else {})}
+
+
+def execute_staged(s):
+    """Write the run folder and queue the first stage."""
+    try:
+        state = vs_staged.start(staged_plan(s), submit=(s.mode == "submit"))
+    except vs_staged.StagedError as exc:
+        fail(str(exc))
+        sys.exit(1)
+    if s.protonated is not None:
+        with open(os.path.join(s.rundir, "protonation_report.txt"), "w") as fh:
+            fh.write(s.protonated.report_text())
+    c = state["counts"]
+    ok(f"Run folder ready: {s.rundir} ({c['molecules']:,} molecules in {c['collections']:,} collections).")
+    if c.get("unreadable"):
+        warn(f"{c['unreadable']:,} molecule(s) could not be read and are left out.")
+    say("")
+    if s.mode == "save":
+        say(f"  Start it with:  {RUN_COMMAND} advance {s.rundir}")
+        return
+    ok("The first stage is queued. The stages follow each other by themselves.")
+    say(f"  Follow it:       {RUN_COMMAND} status {s.rundir}")
+    say(f"  Top results:     {RUN_COMMAND} results {s.rundir}      (when it has finished)")
+    say(f"  If a stage fails (an email is sent), fix the cause and run:  {RUN_COMMAND} advance {s.rundir} --retry")
+    say(f"  The ranked table will be {os.path.join(s.rundir, 'results', 'ranking.csv')}.")
+
+
+def ask_screen_mode():
+    say("  How should the molecules be docked?\n")
+    return ask_menu([
+        ("full", "Dock every molecule and keep the poses. The tested choice for libraries up to a few million "
+                 "molecules."),
+        ("staged", "Staged screen with AdaptiveFlow: AFLP prepares forms of every molecule (stereoisomers, "
+                   "tautomers), AFVS docks them on the cluster, either all of them or only the best tranches. Keeps "
+                   "scores, not poses. Built for libraries that are too big to dock whole; only your own library is "
+                   "supported so far.")], 1)
+
+
 def execute(s, ask_watch=True, wait=False):
     """Do what the review said: run the docking here, or write the job script and submit it."""
+    if s.screen == "staged":
+        return execute_staged(s)
     os.makedirs(s.rundir, exist_ok=True)
     write_files(s)
     if s.mode == "run":
@@ -1487,6 +1833,11 @@ def check_environment():
 def run_steps(s, cfg):
     step_protein(s, cfg)
     step_site(s, cfg)
+    if s.screen == "staged":
+        step_staged_settings(s, cfg)
+        step_ligands(s, cfg)
+        step_staged_run(s, cfg)
+        return
     step_settings(s, cfg)
     step_ligands(s, cfg)
     step_run(s, cfg)
@@ -1500,6 +1851,7 @@ def run_interactive():
     say(f"Everything you answer is saved as a run file, so the same run can be repeated with `{RUN_COMMAND} <file>`.")
     submitted = False
     try:
+        s.screen = ask_screen_mode()
         run_steps(s, None)
         if not step_review(s):
             say("\nCancelled. Nothing was run.")
@@ -1520,6 +1872,7 @@ def run_from_file(path, check_only=False):
         print(f"\n{exc}\n\nNothing was run. Print an annotated example with:  {RUN_COMMAND} --example")
         sys.exit(2)
     s = Settings()
+    s.screen = cfg["screen"]
     say(bold("\nVirtual screening"))
     say(f"Run file: {cfg['file']}")
     try:

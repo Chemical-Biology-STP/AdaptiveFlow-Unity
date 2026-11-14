@@ -34,3 +34,11 @@ text with the copied files. Several terminal helpers and the structure of the ru
 
 The test receptor and ligand in `test/data/` (`pocket.pdb`, `pocket_noh.pdb`, `crystal_ligand.sdf`) are cut from the BACE1 test
 complex of the same repository and are covered by the same licence.
+
+# AdaptiveFlow code in third_party/
+
+`third_party/AFVS` and `third_party/AFLP` hold unmodified scripts and templates of AdaptiveFlow for Virtual Screening
+and for Ligand Preparation (https://github.com/QuantumAI4Bio/AdaptiveFlow-VS and .../AdaptiveFlow-LP), released under
+the GNU General Public License v2, the same licence as this repository. Their licence files are in those folders; the
+pinned commits are in `third_party/VERSIONS.md`. Reference: Gorgulla et al., "AI-Enhanced Adaptive Virtual Screening
+Platform Enabling Exploration of 69 Billion Molecules Discovers Structurally Validated FSP1 Inhibitors" (bioRxiv 2025).

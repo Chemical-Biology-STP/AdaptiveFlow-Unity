@@ -171,11 +171,188 @@ time, keeps only a few in flight, and appends one line per finished molecule to 
 loses nothing; stopping one with SIGTERM (what SLURM sends at the time limit) and resuming gave a complete,
 duplicate-free table. Each molecule gets its own folder, grouped by thousands.
 
-### Tests
-From the tool folder: `pixi run test` runs 331 fast tests (about 15 seconds: ligand preparation, charge states, results
-table, run files, SLURM scripts, wizard, command line). `pixi run test-all` adds 36 tests that dock with the real
+### Staged screening with AdaptiveFlow (your own library)
+
+The design and what was measured while building it are in `docs/DESIGN_staged_screening.md`.
+
+The first question of the assistant is how the molecules should be docked. **Dock every molecule** is everything
+above. **Staged screen** hands the work to AdaptiveFlow: AFLP prepares every molecule (stereoisomers, tautomers,
+protonation at a pH, 3D coordinates) and AFVS docks the prepared forms, both as SLURM job arrays, and the best form of
+each molecule is ranked. The upstream code is in `third_party/` (GPL v2, pinned commits in `third_party/VERSIONS.md`)
+and is not changed; the tool writes the configuration of each run into the run folder.
+
+It keeps scores, not poses (AFVS stores no poses); `vs redock` (below) gets the poses of the best molecules.
+Your own SMILES or SDF library is supported, with two strategies and an optional neural-network filter (below). The
+ultra-large Enamine REAL Space library is not built yet.
+
+Start it from the assistant, or with a run file (`vs --example` shows the keys):
+
+```yaml
+receptor: protein.pdb
+reference_ligand: ligand.sdf
+ligands: library.smi
+output: run_staged
+screen: staged
+docking: {program: qvina, exhaustiveness: 16}
+staged: {max_stereoisomers: 1, max_tautomers: 1}   # forms prepared per molecule; every form is docked
+run: {mode: submit, cpus: 500}
+```
+
+**Two strategies.** `staged.strategy` is `all` (the default) or `tranche`.
+
+- `all` docks every prepared form. Complete, and the cost grows with the library.
+- `tranche` is the ATG strategy of AdaptiveFlow. The molecules are grouped into tranches by their properties
+  (molecular weight, logP, hydrogen-bond acceptors and donors by default; `tranche_properties` can name any of the 18
+  of the tranche ID). A few forms of every tranche (`representatives`, 1 to 10, default 3) are docked first, the
+  prescreen. Each tranche is scored by the mean score of its prescreened forms, and the best tranches are docked in
+  full until about `primary_size` molecules are reached (default 20% of the library). Whole collections are taken, so
+  the primary screen can be a little larger than asked for. A tranche is a group of similar molecules, so a good
+  mean score makes it likely that the tranche holds good molecules; it is a bet, not a guarantee.
+
+```yaml
+staged:
+  strategy: tranche
+  representatives: 3          # forms docked per tranche in the prescreen
+  primary_size: 100000        # molecules docked in the primary screen
+  tranche_properties: [mw, logp, hba, hbd]
+```
+
+The tranches are made by this tool with RDKit (AFLP's own assignment needs ChemAxon and only renames files). The 18
+properties are mw, logp, hba, hbd, tpsa, atomcount, bondcount, mr, ringcount, aromaticringcount, formalcharge,
+positivechargecount, negativechargecount, fsp3, chiralcentercount, halogencount, sulfurcount and NOcount. A property
+that is not chosen counts as one class for all molecules, so the library falls into few tranches that each hold many
+molecules; the real REAL Space library has about 5,600 per tranche. A property has up to six classes (A to F). The class limits are the default cutoffs of AFLP; where AFLP has more than six classes (ringcount, NOcount) the upper ones are merged or the steps are made coarser. The assistant samples the library (up to 3,000 molecules) and shows the number of tranches and the size of
+the prescreen before anything is submitted; for a library bigger than the sample the number of tranches is an estimate.
+
+The stages follow each other by themselves: each ends by queueing a small `advance` job that waits for the stage's jobs,
+checks their output and submits the next stage. The run folder keeps its state in `state.json`.
+
+```
+vs status  <run folder>            where the run is
+vs results <run folder> [--top N]  the best molecules
+vs advance <run folder> [--retry]  continue by hand; --retry after a stage stopped and the cause is fixed
+vs redock  <run folder> [--top N]  dock the best molecules again and keep their poses (see below)
+```
+
+You get an email if a stage fails and when the run ends. The tables are `results/ranking.csv` (best first) and
+`results/results.csv` (input order), with the number of forms docked and the best form of each molecule. A molecule
+that AFLP cannot prepare is listed with status `failed`. With the tranche strategy a molecule that was prepared but whose
+collection was not chosen for the primary screen has status `not_docked`, the tables have a `tranche` column, and
+`results/tranche_scores.csv` lists every tranche with its mean and best prescreen score and whether it was selected.
+
+**Poses for the best molecules.** When a run has finished, `vs redock <run folder> --top 1000` writes the best 1,000
+molecules (the best form of each, as AFLP prepared it, with its charge state kept) to `redock_input/` and starts an ordinary
+full-mode run on them in `<run folder>/redock/`, with the protein, box, program, exhaustiveness and seed of the staged
+run. `--exhaustiveness`, `--num-modes` and `--cpus` change those; `--save` only prepares the job. The poses are in
+`redock/results/` (`top_poses.sdf`, `all_poses.sdf`, per-molecule folders). When it has finished,
+`vs redock <run folder> --report` writes `results/redock_comparison.csv` (staged score, new score, difference) and prints
+a summary. Measured on the top 20 molecules of the 3,000-molecule run below: all 20 docked with 9 poses, the new
+score was 0.17 kcal/mol worse on average, 17 of 20 within 0.5 (correlation 0.65 over these 20), and it ran for about 5
+minutes on 20 CPUs. The two scores differ because the full mode prepares its own 3D conformers. A staged run started
+before this feature does not keep its protein file; the command then uses the file named in the run's plan, if it still exists.
+
+**CPUs.** The assistant suggests 500 CPUs working at the same time (fewer for a small library) and allows as many as
+the cluster lets one user have, read from the scheduler (3,000 on `ncpu`). The work is cut into jobs of 32 CPUs of about
+25 minutes, so the number is used in steps of 32. Above 1,000 CPUs or 100,000 CPU-hours it asks for confirmation.
+
+**Cost.** Every prepared form is a docking. One stereoisomer and one tautomer (the default) is one form per molecule.
+AFLP's own defaults (5 and 5) gave 4.57 forms per molecule on 200 Enamine molecules and make the docking 4.6 times
+more expensive. The review page shows the estimate (CPU-hours, wall time, jobs, disk) before anything is submitted.
+
+**Measured** (200 Enamine molecules, QuickVina, exhaustiveness 16, the test pocket, one form each, 32 CPUs per job):
+199 were prepared and docked, and the ranked table was ready 9 minutes after the start (about 1 minute of AFLP, the rest
+docking and ranking). Their scores against the full mode: mean difference 0.00 kcal/mol, 177 of 199 within 0.5,
+identical for 34 (the 3D conformers and charge states are made differently). In a manual run of the same molecules
+with AFLP's defaults (4.57 forms each), the best form scored 0.18 kcal/mol better on average. The one molecule that
+failed (`CCOC(C)=C(C#N)C(=O)O`) got a nonsensical charge state from Open Babel at pH 7.4; AFLP reported its form as
+failed but the molecule as a success, and the tool lists it as failed. AFVS keeps a log of every docking, about 4.5 KB
+each (4.5 GB per million forms).
+
+**Neural-network filter** (`staged.ml_filter: true`, with the tranche strategy). After the tranches are chosen, AdaptiveFlow's
+filter looks at every form of the selected tranches and drops those that are unlikely to dock well, so the primary screen
+docks fewer forms. The network is trained on the prescreen: Morgan fingerprints of the forms (the SMILES AFLP wrote into
+each form), and the best 25% of the prescreen scores as the positive class. `primary_size` is then the pool the filter looks
+at, so choose it 2 to 3 times larger than without the filter; `ml_cutoff` (default 0.5, from 0.05 to 0.95) is the predicted
+probability a form needs to be docked. The recipe is the one of AdaptiveFlow's `ml_classifier.py` (network of
+1024-512-256-128-1, Adam, batches of 256, early stopping), written with numpy: PyTorch would add 1.3 GB to the
+environment (measured), and the models are not interchangeable with AdaptiveFlow's. 15% of the prescreen is held back to
+measure the model. **The filter is not used, and the whole pool is docked, when the prescreen has fewer than 200 scored
+forms or the model's area under the ROC curve on the forms held back is below 0.6**; the run says so, in `status` and in
+`results/ml_filter.json`, which also gives the area under the curve and the share of positives the cutoff recalls. A form
+whose SMILES cannot be read is kept. The probability of every form is in `results/ml_filter.csv`. The filter runs inside
+the `advance` job (4 CPUs, 6 GB more memory), in up to 4 processes. Training uses at most 200,000 prescreen forms
+(100,000 forms took 94 s). Applying the model ran at about 14,000 forms per second per process on short made-up
+SMILES while the machine was busy with other jobs; real drug-like molecules are slower to fingerprint. A pool of a few million
+forms takes minutes, but one of hundreds of millions would take days in this single job, so the filter is meant for
+pools of up to a few tens of millions of forms until it is spread over an array.
+
+Measured on the 3,000-molecule run (the filter was trained on its 431 prescreen forms; AUC 0.71 on the 64 held back, so a
+weak model from little data, one training per setting). The forms docked are the prescreen plus what the primary screen
+docks; the control docked all 2,993 forms:
+
+| Strategy | Forms docked | Best 30 found | Best 100 | Best 300 |
+|---|---|---|---|---|
+| tranches, pool 608 | 910 (30%) | 22 | 60 | 172 |
+| tranches, pool 930 | 1,181 (39%) | 23 | 71 | 212 |
+| tranches, pool 1,308 | 1,502 (50%) | 26 | 81 | 239 |
+| tranches, pool 1,935 | 2,076 (69%) | 30 | 99 | 293 |
+| pool 930 + filter at 0.5 | 852 (28%) | 21 | 61 | 180 |
+| pool 1,308 + filter at 0.5 | 1,000 (33%) | 24 | 71 | 203 |
+| pool 1,935 + filter at 0.5 | 1,260 (42%) | 28 | 86 | 244 |
+| pool 1,935 + filter at 0.7 | 620 (21%) | 22 | 58 | 131 |
+| pool 1,935 + filter at 0.3 | 1,887 (63%) | 30 | 98 | 289 |
+
+Between the rows without the filter, 1,260 forms would find about 24, 74 and 221, so the best filtered row finds 4, 12 and
+23 more of the best 30, 100 and 300 for the same docking. The filter at 0.7 drops too much for this weak model and does
+worse than tranches alone at the same cost, and at 0.3 it saves little. The gain comes from the same prescreen data the
+tranche selection already uses, and with so little training data the model is weak; a prescreen of millions of forms should
+train a better one, which has not been measured here.
+
+A full run through SLURM with the filter on (the same 3,000 molecules, but exhaustiveness 2 to keep it short, pool of 1,900
+molecules): AFLP made 2,993 forms, the prescreen docked 431, 113 of 175 tranches were selected (1,926 forms), the model
+trained on 174 prescreen forms had an area under the curve of 0.80 on 65 held back and kept 1,458 of the 1,926 (76%), and
+AFVS docked exactly those 1,458 forms (checked against the form lists: none missing, none extra). With scores this noisy (exhaustiveness
+2) the model separates less sharply, so do not read the 76% as typical.
+
+**Measured, tranche strategy** (3,000 Enamine molecules, QuickVina, exhaustiveness 16, one form each; the control
+docked all 2,993 prepared forms). 175 tranches (properties mw, logp, hba, hbd), 431 forms in the prescreen (3 per
+tranche), 52 tranches and 608 forms in the primary screen: 910 forms docked, 30% of the library, 7 molecules not
+prepared by AFLP. The run took 56 minutes with a free queue, 32 CPUs per stage (preparation 8 minutes, prescreen 18, primary 30
+minutes; a library this small fills one job per stage whatever CPU number is asked for), 19 CPU-hours of
+docking. It found 22 of the true best 30, 60 of the best 100 and 172 of the best 300 (a random 30% would find 9, 30 and
+91). The median score of the primary screen was -8.2 against -7.5 for the library. How much the strategy finds depends on
+which forms are drawn as representatives: replaying the selection on the control scores with 500 different draws gave
+25 of the best 30 on average (22 to 28 for 90% of the draws), 73 of the best 100 (63 to 81) and 187 of the best 300
+(169 to 203). This run's draw was on the low side (a replay of the same representatives gives 22, 61 and 179). The
+scores of a form differ a little between preparations of the same molecule (mean difference 0.13 kcal/mol, identical
+for 487 of 910 forms) because the 3D conformers are not the same each time. A library of 3,000 molecules in 175
+tranches is not the REAL Space library (about 5,600 molecules per tranche); how well the strategy works there has not
+been measured.
+
+**Limits of this first version.**
+- The ranking keeps every molecule in memory: 1.1 GB per million molecules, 14 s per million (measured on synthetic
+  tables); the job that does it asks for that much. Up to a few tens of millions is fine; beyond that it needs a
+  different approach.
+- A staged run can take days. Its jobs use the copy of this tool that started them, and ddsuite deletes a replaced
+  version after 14 days (`keep_old_versions_days`). Do not let a run outlive an update by that long; ask the
+  maintainer to keep the old version if it must.
+- Only your own library is supported. The Enamine REAL Space library (needs registration and AWS credentials) is not
+  built.
+- The tranche library is built in one job that keeps the compressed forms in memory (about 3 GB per million forms) and
+  writes them again as tranche collections, so the library is stored twice (AFLP's output and the tranche
+  collections). It is meant for libraries of up to a few million molecules; the real REAL Space library will need the
+  tranche layout it already has.
+- The prescreen forms of a selected tranche are docked again in the primary screen (same scores, a little wasted work).
+- A stopped stage is not repaired automatically: `advance --retry` submits the failed work unit again as a whole.
+
+Also tested: the stage logic with a stand-in scheduler (including a failed job, a retry and two `advance` at once) in
+`test/test_staged.py`, and the real thing on the cluster in `test/test_staged_cluster.py` (`pixi run test-cluster`,
+three runs (each strategy, and the filter on a library too small for it), about 1.5 minutes each with a free queue, longer when the queue is busy).
+
+From the tool folder: `pixi run test` runs 638 fast tests (about 20 seconds: ligand preparation, charge states, results
+table, run files, SLURM scripts, wizard, command line, the staged screen with a stand-in scheduler). `pixi run test-all` adds 36 tests that dock with the real
 programs on a small receptor (about 7 more minutes): every offered program, resume after a stop, a killed worker
-process, and the output files. The tests do not judge whether docking scores are scientifically good; they check that
+process, and the output files. `VS_CLUSTER_TEST_DIR=<shared folder> pixi run test-cluster` submits a real staged run to SLURM. The tests do not judge whether docking scores are scientifically good; they check that
 the tool does what it says.
 
 ## Prerequisites (standalone use)
@@ -195,6 +372,8 @@ share the main environment). The main environment holds Python 3.12, RDKit, Meek
 * `vs_wizard.py`: The assistant's steps (protein, binding site, settings, molecules, how to run, review). 
 * `vs_dock.py`: The docking engine used by the assistant and by the job script (receptor and ligand preparation, docking, re-scoring, results). 
 * `vs_slurm.py`, `vs_runfile.py`, `vs_ui.py`: The SLURM job script, the YAML run file, and terminal helpers. 
+* `vs_staged.py`: Staged screening with AdaptiveFlow: configuration of each run, the stages, the `status`/`advance`/`results` commands.
+* `third_party/`: Unmodified AdaptiveFlow code (AFVS and AFLP, GPL v2) used by the staged screen; see `third_party/VERSIONS.md`.
 * `structure_prep.py`, `protein_prep.py`: Complex clean-up and protonation (from the anchored_docking_workflow repository, see `NOTICE.md`). 
 * `vs_classic.py`: Classic mode: builds a run folder and runs `run_vf_unity.py` inside it. 
 * `run_vf_unity.py`: Main file that initiates docking calculations. 

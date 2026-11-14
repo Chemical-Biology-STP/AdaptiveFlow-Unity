@@ -1,0 +1,682 @@
+# Each line which starts with '#' is a comment/description of the variable above the comment
+
+
+****** Job Resource Configuration
+
+job_name=testing
+# alphabetic characters (i.e. letters from a-z or A-Z)
+# Used to describe distinct runs (using the same name will
+# overwrite data if using S3!)
+
+threads_to_use=384
+# This sets how many processes the main execution loop should be using
+# to process. This is generally 2x the number of vCPUs or hyperthreads
+# available on the system it is being run on
+
+
+************************************************
+** Batch system configuration
+************************************************
+
+batchsystem=slurm
+# Possible values: awsbatch, slurm, bash
+
+****** AWS Batch Options (if batchsystem=awsbatch)
+
+### To use AWS Batch you must first complete the steps outlined
+### in the user guide for AWS Batch
+
+aws_batch_prefix=af
+# Prefix for the name of the AWS Batch queues. This is normally 'af'
+# if you used the CloudFormation template
+
+aws_batch_number_of_queues=2
+# Should be set to the number of queues that are setup for AWS Batch.
+# Generally this number is 2 unless you have a large-scale (100K+ vCPUs)
+# setup
+
+aws_batch_jobdef=af-jobdef-aflp
+# Generally this is [aws_batch_prefix]-jobdef-aflp
+# (e.g. if aws_batch_prefix=af, then aws_batch_jobdef=af-jobdef-aflp
+
+aws_batch_array_job_size=2
+# Target for the number of jobs that should be in a single array job for AWS Batch.
+
+aws_ecr_repository_name=af-aflp-ecr
+# Set it to the name of the Elastic Container Registry (ECR)
+# repository (e.g. af-aflp-ecr) in your AWS account
+# (If you used the template it is generally af-aflp-ecr)
+
+aws_region=us-east-1
+# Set to the AWS location code where you are running AWS Batch
+# (e.g. us-east-1 for North America, Northern Virginia)
+
+aws_batch_subjob_vcpus=8
+# Set to the number of vCPUs that should be launched per subjob.
+# 'threads_to_use' above should be >= to this value.
+
+aws_batch_subjob_memory=15000
+# Memory per subjob to setup for the container in MB
+
+aws_batch_subjob_timeout=10800
+# Maximum amount of time (in seconds) that a single AWS Batch job should
+# ever run before being terminated.
+
+****** Slurm Options (if batchsystem=slurm)
+
+slurm_template=./templates/template1.slurm.sh
+# Template for the slurm job
+# Additional slurm attributes can be added directly to this
+# template file if they are not available as pass throughs from
+# AFVS
+
+slurm_array_job_throttle=1
+# Maximum number of jobs running within a single slurm array job
+
+slurm_account=
+# Slurm account to use. If not set, default account is used
+
+slurm_partition=standard96
+# Partition to submit the job
+
+slurm_cpus=192
+# Number of CPUs that are being used
+
+slurm_array_job_size=1
+# Maximum number of concurrent jobs from a single array job
+# that should be run
+
+slurm_job_submission_timeout=10
+# Timeout for submission of slurm jobs
+
+****** Bash Options (if batchsystem=bash)
+
+bash_template=./templates/template1.bash
+# Template for the bash script used
+
+bash_array_job_size=100
+# How many to group under a single workunit
+
+************************************************
+** Storage configuration
+************************************************
+
+job_storage_mode=sharedfs
+# This mode determines where data is retrieved and stored from as part of
+# AFVS. Valid modes:
+#   * s3: Job data is stored on S3 object store, which is the required
+#         mode if using AWS Batch. Items under the "S3 Object Store"
+#         heading in the configuration are required if this mode is used
+#   * sharedfs: This mode requires that all running jobs have access to the
+#         same shared filesystem that will allow for both input and output
+#         of data. This is required if using Slurm
+
+job_storage_output_addressing=standard
+# If input is placed with the hash addressing mode, then use 'hash'.
+# otherwise use "standard" for the classic addressing mode
+# 'hash' will place data in:
+#     [0-f][0-f]/[0-f][0-f]/complete/<output_type>/<metatranche>/<tranche>/<collection>
+# 'standard' will place data in:
+#     complete/<output_type>/<metatranche>/<tranche>/<collection>
+
+
+****** Object Store Settings (S3)
+
+object_store_input_ligand_library_bucket=adaptiveflow-data
+# Bucket name for the collection data
+# Trailing slashes should be used
+
+object_store_input_ligand_library_prefix=aflp/data/Enamine_2021_test
+# Prefix used within the object store to address the collections
+# Trailing slashes should be used
+
+object_store_job_output_data_bucket=adaptiveflow-data
+# Bucket name for the job data
+# Trailing slashes should be used
+
+object_store_job_output_data_prefix=jobs/aflp
+# Where to place job-specific data. This includes where AdaptiveFlow will place
+# the input data needed for jobs as well as the output files. Data be be placed
+# in object_store_job_output_data_prefix/<job_letter>
+# Trailing slashes should be used
+
+****** Shared Filesystem Settings
+
+collection_folder=../input-files/collections
+# Path to where the collection file are stored
+#  * This is used when job_storage_mode=sharedfs or
+#    when the uploader helper script is being used
+#
+# Slash at the end is not required (optional)
+# Either pathname is required w.r.t. the folder tools/
+#     or absolute path (e.g. /home/afuser/collections)
+
+# Output of processed ligands will be placed in
+# ../workflow/complete (where ../workflow is relative to the tools
+# directory of the AFVS installation
+
+****** Workflow Options
+
+ligands_todo_per_queue=1000
+# Used as a limit of ligands for the to-do lists.
+# A reasonable number for this is generally 1000. The length of time
+#     to process will depend on the docking scenarios run
+
+tempdir_default=/dev/shm
+# The directory which is used for the temporary workflow files which need a normal performance
+# Is normally a local SSD or HDD. A temporary directory will be created underneath this dir
+
+tempdir_fast=/dev/shm
+# The directory which is used for the temporary workflow files which need a fast perfomance
+# Should be a a local ram filesystem/ramdisk. A temporary directory will be created underneath this dir
+
+store_all_intermediate_logs=false
+# This determines if the intermediate files (all intermediate steps) are 
+# retained for review after a run. This is not recommended unless you
+# are debugging as it increases output by over 2x
+# Valid values:
+#   * true: Keep the logs. They will be placed in intermediate/
+#   * false: Do not retain the logs
+
+
+************************************************
+** Ligand Preparation Options
+************************************************
+
+
+****** Desalting
+
+desalting=true
+# If true, extracts the largest organic part of the molecule
+# Possible values:
+#   * false
+#   * true
+
+desalting_obligatory=false
+# Setting only required if desalting=true
+# Possible values:
+#   * true: Successful desalting of the ligand is mandatory (unsuccessful desalting leads to the omission of this ligand).
+#   * false: The ligand will continue to be processed even if the desalting step fails.
+
+****** Neutralization
+
+neutralization=true
+# Neutralizes molecules using JChem's Standardizer of ChemAxon
+# Possible values:
+#   * false
+#   * true
+
+neutralization_program_1=obabel
+neutralization_program_2=none
+# Program 1 is used at first for each ligand, and if it fails program 2 is used instead. If the second program also fails, then the ligand is skipped.
+# Setting only required if neutralization=true
+# Possible values:
+#   * obabel
+#   * standardizer
+#   * none (only for neutralization_program_2)
+
+chemaxon_neutralization_timeout=15
+# Time in seconds to wait to timeout for neutralization with chemaxon
+
+obabel_neutralization_timeout=15
+# Time in seconds to wait to timeout for neutralization with obabel
+
+neutralization_mode=only_genuine_desalting_and_if_charged
+###neutralization_mode=after_desalting_if_charged
+# Only relevant if neutralization=true
+# Possible values:
+#   * always: always neutralize the molecule
+#   * only_genuine_desalting: only neutralize the molecule if the input structure
+#     contained more than one component
+#   * only_genuine_desalting_and_if_charged: only neutralize if the input structure
+#     contained more than one component and if the smallest component contained an ion
+
+
+neutralization_obligatory=false
+# Setting only required if neutralization=true
+# Possible values:
+#   * true: Successful neutralization of the ligand is mandatory (unsuccessful neutralization leads to the omission of this ligand).
+#   * false: The ligand will continue to be processed even if the neutralization step fails.
+# Settable via range control files: Yes
+
+****** Stereoisomer Generation
+
+stereoisomer_generation=true
+# Possible values:
+#   * false
+#   * true
+
+stereoisomer_generation_program_1=rdkit
+stereoisomer_generation_program_2=none
+# Program 1 is used at first for each ligand, and if it fails program 2 is used instead. If the second program also fails, then the ligand is skipped.
+# Setting only required if stereoisomer_generation=true
+# Possible values:
+#   * rdkit
+#   * cxcalc
+
+stereoisomer_obligatory=false
+# Setting only required if stereoisomer_generation=true
+# Possible values:
+#   * true: Successful stereoisomer generation of the ligand is mandatory
+#           (unsuccessful stereoisomer generation leads to the omission of this ligand).
+#   * false: The ligand will continue to be processed even if the stereoisomer generation
+#            step fails.
+
+cxcalc_stereoisomer_generation_options=-T -f smiles
+# any options which should be passed to the stereoisomer plugin of cxcalc
+# This setting has to contain the "-f smiles" option
+# The "-T" option for instance specifies that that chiral carbons should be preserved.
+# Documentation on the options is available here:
+#     https://docs.chemaxon.com/display/docs/cxcalc-calculator-functions.md#src-1806682-cxcalccalculatorfunctions-stereoisomers
+
+rdkit_stereoisomer_generation_unique_correction=false
+# Enumeration of stereoisomers by RDkit can result in redundant stereoisomers
+# This can be resolved by setting this option to true. However, can be time consuming
+
+rdkit_stereoisomer_max_count=5
+# Setting maximum number of stereoisomers to be generated when using RDKit.
+
+cxcalc_stereoisomer_timeout=15
+# Time in seconds to wait to timeout for cxcalc
+
+obabel_stereoisomer_timeout=30
+# Time in seconds to wait to timeout for obabel
+
+****** Tautomerization
+
+tautomerization=true
+# Possible values:
+#   * false
+#   * true
+
+tautomerization_program_1=rdkit
+tautomerization_program_2=none
+# Program 1 is used at first for each ligand, and if it fails program 2 is used instead. If the second program also fails, then the ligand is skipped.
+# Setting only required if tautomerization=true
+# Possible values:
+#   * obabel
+#   * cxcalc
+#   * rdkit
+#   * none (only for tautomerization_program_2)
+
+tautomerization_obligatory=false
+# Setting only required if tautomerization=true
+# Possible values:
+#   * true: Successful tautomerization of the ligand is mandatory (unsuccessful tautomerization leads to the omission of this ligand).
+#   * false: The ligand will continue to be processed even if the tautomerization step fails.
+
+cxcalc_tautomerization_options=
+# any options which should be passed to the tautomerization plugin of cxcalc
+
+obabel_tautomer_max_count=20
+# Setting maximum number of tautomers to be generated when using Open Babel.
+
+rdkit_tautomer_max_count=5
+# Setting maximum number of tautomers to be generated when using RDKit.
+
+cxcalc_tautomerization_timeout=15
+# Time in seconds to wait to timeout for tautomerization with cxcalc
+
+obabel_tautomerization_timeout=30
+# Time in seconds to wait to timeout for tautomerization with obabel
+
+****** Protonation State Generation
+
+protonation_state_generation=true
+# Possible values:
+#   * false
+#   * true
+
+protonation_program_1=obabel
+protonation_program_2=none
+# Program 1 is used at first for each ligand, and if it fails program 2 is used instead. If the second program also fails, then the ligand is skipped.
+# Setting only required if protonation_state_generation=true
+# Possible values:
+#   * obabel
+#   * cxcalc
+#   * qupkake
+#   * epik7
+#   * none (only for protonation_program_2)
+
+cxcalc_protonation_timeout=15
+# Time in seconds to wait to timeout
+
+obabel_protonation_timeout=15
+# Time in seconds to wait to timeout
+
+qupkake_protonation_timeout=15
+# Time in seconds to wait to timeout
+
+epik7_protonation_timeout=300
+# Time in seconds to wait to timeout
+
+qupkake_conda_env=qupkake
+# Setting only required if qupkake used as protonation_program
+# Specify name or location of qupkake conda env
+
+epik7_protonation_options=
+# Set additional options for protonation with Schrodinger's Epik 7
+# Note: License required
+
+protonation_obligatory=false
+# Setting only required if protonation_state_generation=true
+# Possible values:
+#   * true: Successful protonation of the ligand is mandatory (unsuccessful
+#     protonation leads to the omission of this ligand).
+#   * false: The ligand will continue to be processed even if the protonation step fails.
+#     This might light to protonation states which are unphysiological.
+
+protonation_pH_value=7.4
+# Setting only required if protonation_state_generation=true
+# Possible values: floating point number between 0.0 and 14.0
+
+
+****** Conformation Generation
+
+conformation_generation=true
+# Generation of 3D conformation/coordinates of the ligand
+# Possible values:
+#   * false
+#   * true
+
+conformation_program_1=molconvert
+conformation_program_2=rdkit
+# Setting only required if conformation_generation=true
+# Program 1 is used at first for each ligand, and if it fails program 2 is used instead.
+# If the second program also fails, then the ligand is skipped.
+#
+# Possible values:
+#   * obabel
+#   * molconvert
+#   * rdkit
+#   * none (only possible for conformation_program_2)
+
+molconvert_3D_options=-3:{fine}
+# Setting only required if conformation_generation=true and one of the programs used is molconvert
+# 3D conformation generation options for molconvert.
+# See also the help text printed by molconvert for additional information
+# Possible values:
+#   * -3           Defaults to value 3{fast}
+#   *  3{fine}     Find low energy conformer Leave failed fragments intact
+#   *  3{fast}     Fast clean, if failed, perform fine clean, accept any generated structure (default)
+#   *  3{nofaulty} Same as S{fast}, but leave failed fragments intact.
+
+molconvert_conformation_timeout=15
+# Time in seconds to wait to timeout
+
+obabel_conformation_timeout=15
+# Time in seconds to wait to timeout
+
+rdkit_conformation_num=3
+# Set the number of conformers generated by rdkit
+# The one with the lowest energy of the ensemble will be used
+
+rdkit_conformation_timeout=30
+# Time in seconds to wait to timeout
+
+conformation_obligatory=true
+# Setting only required if conformation_generation=true
+# Possible values:
+#   * true: Successful 3D conformation generation of the ligand is mandatory
+#     (unsuccessful conformation generation leads to the omission of this ligand).
+#   * false: The ligand will continue to be processed even if the conformation
+#      generation step fails.
+
+
+****** Target Format Generation
+
+targetformats=pdbqt
+# Possible values:
+#     * selfies (https://github.com/aspuru-guzik-group/selfies)
+#     * Any format supported by the Open Babel, using the file format identifiers used by Open Babel.
+#       A complete list can be obtained by running the command "obabel -L formats"
+# Multiple target formats can be specified by separating them with colons, e.g. pdb:sdf:pdbqt
+
+
+****** Open Babel
+
+obabel_memory_limit=1000000
+# In KB
+# Recommended value: >= 500000
+
+
+****** Energy and Conformer Check
+
+energy_check=true
+# Determines whether the potential energy is checked by obenergy (Open Babel Energy). This can be useuful to filter out compounds with unrealistic predicted 3D geometry
+# Possible values:
+#   * true
+#   * false
+
+energy_max=10000
+# Maximum allowed energy value (in kJ/mol). Recommended: 10000
+# Possible values: Positive integer
+
+obenergy_timeout=30
+# Time in seconds to wait to timeout for energy check with obenergy
+
+posebusters_check=false
+# Determines whether the conformer is checked by posebusters
+# Possible values:
+#   * true
+#   * false
+
+posebusters_check_values=1:1:1:1:1:1:1:1:1
+# Define which posebusters check needs to be passed (1 = needs to be passed, 0 = allowed to fail)
+# Checks: sanitization,all_atoms_connected,bond_lengths,bond_angles,internal_steric_clash,aromatic_ring_flatness,double_bond_flatness,internal_energy
+# Possible values:
+#   * colon-separated list of nine integers (0 or 1)
+#   * 1:1:1:1:1:1:1:1:1 (e.g. for all checks to be passed)
+
+posebusters_timeout=5
+# Time in seconds to wait to timeout for posebusters conformer check
+
+
+****** Tranche Assignments
+
+tranche_assignments=false
+# Should each ligand be assigned a new tranche based based on molecular properties of the ligand?
+# This is useful in particular if the tranches of the input ligands are pseudo-tranches (i.e. are arbitrary or have no meaning).
+
+tranche_types=
+# These variables are only needed if tranche_assignments=true
+# Multiple values are separated by colons
+# Possible values:
+#   * mw_jchem: molecular weight
+#   * mw_obabel: molecular weight
+#   * logp_jchem: octanol water partition coefficient by JChem's cxcalc
+#   * logp_obabel: octanol water partition coefficient by Open Babel
+#   * hba_jchem: hydrogen bond acceptor count
+#   * hba_obabel: hydrogen bond acceptor count
+#   * hbd_jchem: hydrogen bond donor count
+#   * hbd_obabel: hydrogen bond donor count
+#   * rotb_jchem: rotatable bond count
+#   * tpsa_jchem: topological polar surface area by JChem's cxcalc
+#   * tpsa_obabel: topological polar surface area by Open Babel
+#   * logd: octanol water partition coefficient
+#   * logs: aqueous solubility in mol/L
+#   * atomcount_jchem: number of atoms (including hydrogen)
+#   * atomcount_obabel: number of atoms (including hydrogen)
+#   * bondcount_jchem: numner of bonds (including hydrogen-heavy atom bonds)
+#   * bondcount_obabel: numner of bonds (including hydrogen-heavy atom bonds)
+#   * ringcount: number of non-aromatic rings
+#   * aromaticringcount: number of aromatic rings
+#   * mr_jchem: molecular refractivity by JChem's cxcalc
+#   * mr_obabel: molecular refractivity by Open Babel
+#   * formalcharge: total (formal) charge of the molecule
+#   * positivechargecount: number of positive charged functional groups/atoms
+#   * negativechargecount: number of negatively charged functional groups/atoms
+#   * fsp3: fraction of sp3 hybridized carbon atoms
+#   * chiralcentercount: number of chiral centers
+#   * halogencount: number of halogen atoms (F, Br, Cl, I)
+#   * sulfurcount: number of sulfur atoms (S)
+#   * NOcount: number of oxygen and nitrogen atoms (N, O)
+#   * electronegativeatomcount: number of electronegative atoms (N, O, S, P, F, Br, Cl, I)
+#   * mw_file: molecular weight
+#   * logp_file: octanol water partition coefficient by JChem's cxcalc
+#   * hba_file: hydrogen bond acceptor count
+#   * hbd_file: hydrogen bond donor count
+#   * rotb_file: rotatable bond count
+#   * tpsa_file: topological polar surface area by JChem's cxcalc
+#   * logd_file: octanol water partition coefficient
+#   * logs_file: aqueous solubility in mol/L
+#   * heavyatomcount_file: number of atoms (including hydrogen)
+#   * bondcount_file: numner of bonds (including hydrogen-heavy atom bonds)
+#   * ringcount_file: number of non-aromatic rings
+#   * aromaticringcount_file: number of aromatic rings
+#   * mr_file: molecular refractivity by Open Babel
+#   * formalcharge_file: total (formal) charge of the molecule
+#   * positivechargecount_file: number of positive charged functional groups/atoms
+#   * negativechargecount_file: number of negatively charged functional groups/atoms
+#   * fsp3_file: fraction of sp3 hybridized carbon atoms
+#   * chiralcentercount_file: number of chiral centers
+#   * halogencount_file: number of halogen atoms (F, Br, Cl, I)
+#   * sulfurcount_file: number of sulfur atoms (S)
+#   * NOcount_file: number of oxygen and nitrogen atoms (N, O)
+#   * electronegativeatomcount_file: number of electronegative atoms (N, O, S, P, F, Br, Cl, I)
+#   * enamine_type: Enamine type category
+#   * doublebondstereoisomercount_jchem: number of double-bond steroisomers from JChem
+#   * aromaticproportion_jchem: aromatic proportion generated from JChem
+#   * qed_rdkit: QED generated by RDKit
+
+
+file_fieldnames=smi:ligand-name
+# For each tranche type which reads the value from a file, those values must be defined. 
+# At a minimum 'smi' and 'ligand-name' are REQUIRED (and are generally expected to be the first
+# two items per line
+#
+# e.g. file_fieldnames=smi:ligand-name:-:-:-:-:-:mw:atomcount
+#      This means that the first column should be tghe SMILES string, the second
+#      column is the 'friendly name', columns 3-7 are values not used,
+#      column 8 is the value that should be used for mw_file in tranche assignment,
+#      column 9 is the value that should be used for atomcount_file in tranche assignment
+#      Other valid options include: enamine (for enamine_type), mw, heavyatomcount,
+#         logp, hba, hbd, rotb, fsp3, tpsa
+
+
+# For each tranche_type X in the variable tranche_types, one additional variable "tranche_<X>_partition" has to be specified.
+# This variable has to be a set of N >= 1 values (at least one), separated by colons, which partitions the value range of the molecular property of tranche <X> into N+1 intervals.
+# For example, the partitions '-0:1:2' would result in the 4 intervals: (-∞,0], (0,1], (1,2], (2,∞). The maximum number of allowed intervals is 27 (corresponding to 26 values of the alphabet). Each value has to be an integer or float, and the values have to be in ascending order.
+# These variables are only needed if tranche_assignments=true
+tranche_mw_jchem_partition=200:300:400:450
+tranche_mw_obabel_partition=200:300:400:450
+tranche_mw_file_partition=200:300:400:450
+tranche_logp_jchem_partition=0:2:3:4:5
+tranche_logp_obabel_partition=0:2:3:4:5
+tranche_logp_file_partition=0:2:3:4:5
+tranche_hba_jchem_partition=2:4:7:10
+tranche_hba_obabel_partition=2:4:7:10
+tranche_hba_file_partition=2:4:7:10
+tranche_hbd_jchem_partition=0:2:4:5
+tranche_hbd_obabel_partition=0:2:4:5
+tranche_hbd_file_partition=0:2:4:5
+tranche_rotb_jchem_partition=0:2:4:7:10
+tranche_rotb_obabel_partition=0:2:4:7:10
+tranche_tpsa_jchem_partition=40:80:110:140
+tranche_tpsa_obabel_partition=40:80:110:140
+tranche_tpsa_file_partition=40:80:110:140
+tranche_logd_partition=0:2:3:4:5
+tranche_logd_file_partition=-1:0:1:2:2.5:3:3.5:4:4.5:5
+tranche_logs_partition=-6:-5:-4:-3
+tranche_logs_file_partition=-6:-5:-4:-3
+tranche_atomcount_jchem_partition=10:20:30:40:50
+tranche_atomcount_obabel_partition=10:20:30:40:50
+tranche_heavyatomcount_file_partition=10:20:30:40:50
+tranche_bondcount_jchem_partition=10:20:30:40:50
+tranche_bondcount_obabel_partition=10:20:30:40:50
+tranche_bondcount_file_partition=10:20:30:40:50
+tranche_ringcount_partition=0:1:2:3:4:5
+tranche_ringcount_file_partition=0:1:2:3:4:5
+tranche_aromaticringcount_partition=0:1:2:3:4:5
+tranche_aromaticringcount_file_partition=0:1:2:3:4:5
+tranche_formalcharge_partition=-2:-1:0:1
+tranche_formalcharge_file_partition=-2:-1:0:1
+tranche_mr_jchem_partition=40:80:130
+tranche_mr_obabel_partition=40:80:130
+tranche_mr_file_partition=40:80:130
+tranche_positivechargecount_partition=0:1
+tranche_positivechargecount_file_partition=-2:-1:0:1:2
+tranche_negativechargecount_partition=0:1
+tranche_negativechargecount_file_partition=-2:-1:0:1:2
+tranche_fsp3_partition=0.2:0:4:0:6:0.8
+tranche_fsp3_file_partition=0.2:0.4:0.6:0.8
+tranche_chiralcentercount_partition=0:1
+tranche_chiralcentercount_file_partition=0:1:2:3:4:5
+tranche_halogencount_partition=0
+tranche_halogencount_file_partition=0:1:2:3:4:5
+tranche_sulfurcount_partition=0
+tranche_sulfurcount_file_partition=0:1:2:3:4:5
+tranche_NOcount_partition=0:1:2:3:4:5:6:7:8:9:10
+tranche_NOcount_file_partition=0:1:2:3:4:5:6:7:8:9:10
+tranche_electronegativeatomcount_partition=0:1:2:3:4:5:6:7:8:9:10
+tranche_electronegativeatomcount_file_partition=0:1:2:3:4:5:6:7:8:9:10
+tranche_rotb_file_partition=0:2:4:7:10
+tranche_aromaticproportion_jchem_partition=0:0.25:0.5:0.75
+tranche_doublebondstereoisomercount_jchem_partition=0
+tranche_qed_rdkit_partition=0.2:0.4:0.6:0.8:1.0
+
+# For tranche types that are characters or strings (non-numeric)
+# they should be in the format tranche_(tranche_type)_mapping=M:A,C:B
+#  -- the above sample shows that a string value of "M" should
+#     map to tranche of A, "C" to a tranche of B
+
+tranche_enamine_type_mapping=M:A,S:B
+
+
+****** Attributes
+
+# In addition to the tranche_types above, attributes can be calculated and placed by AFLP
+# as remarks in pdb, pdbqt, and mol2 files.
+
+attributes_to_generate=
+# Multiple values are separated by colons
+# Valid values:
+#   * (any of the tranche_types above). e.g. mr_jchem   
+#   * scaffold_rdkit: Canonical SMI of Murcko scaffold
+
+
+****** JChem-Related Packages
+
+use_cxcalc_helper=0
+# If using AWS Batch, then set this to 1. If not, then set to 0 currently. This option
+# provides an optimization to improve performance of the chemaxon properties
+
+jchem_package_filename=none
+# Required only if cxcalc or molconvert (both of ChemAxon) are used in the preparation steps, and if tranche_assignments=true
+# The filename of the JChem package located in the folder tools/packages/ in the tar.gz format (available on the ChemAxon homepage)
+# The root folder in the archive has to have the name jchemsuite (normally distributed by ChemAxon in this way)
+# Possible values:
+#   * <filename>
+#   * none
+
+chemaxon_license_filename=none
+# Required only if cxcalc or molconvert (both of ChemAxon) are used in the preparation steps.
+# The filename of the license file, which has to be located in the folder tools/packages/
+# Possible values:
+#   * <filename>
+#   * none
+
+java_package_filename=none
+# Required only if cxcalc or molconvert (both of ChemAxon) are used in the preparation steps.
+# Any JRE binary distribution of version of at least version 8.
+# If java is provided by the system (e.g. by loading a module), then no Java package needs to be provided.
+# This has to be a file in the tar.gz format, which has to be located in the folder tools/packages/
+# The root folder in the archive has to have the name "java" (which will be used for the JAVA_HOME variable). This normally needs to be manually changed in the Java package after downloading a JRE.
+# Possible values:
+#   * <filename>
+#   * none
+
+ng_package_filename=none
+# Required only if cxcalc or molconvert (both of ChemAxon) are used in the preparation steps.
+# Nailgun package filename.
+# This has to be a file in the tar.gz format, which has to be located in the folder tools/packages/
+# The root folder in the archive has to have the name "nailgun"
+# Possible values:
+#   * <filename>
+#   * none
+
+java_max_heap_size=4
+# Size in GB
+# Recommended: >= 1 GB * queues_per_step
+# The required memory depends mainly on how many queues are run per step (and thus per JVM/NG server), since one JVM is used per step
+

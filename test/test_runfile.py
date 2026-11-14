@@ -222,3 +222,147 @@ class TestExample:
         import vs_dock
 
         assert f"exhaustiveness: {vs_dock.DEFAULT_EXHAUSTIVENESS}" in vs_runfile.EXAMPLE
+
+
+# --------------------------------------------------------------------------
+# Staged screening
+# --------------------------------------------------------------------------
+
+STAGED = MINIMAL.replace("run:\n  mode: save\n", "screen: staged\nrun:\n  mode: save\n  cpus: 500\n")
+
+
+def problems_of(files, body):
+    with pytest.raises(vs_runfile.RunFileError) as info:
+        vs_runfile.load(write(files, body))
+    return str(info.value)
+
+
+class TestStaged:
+    def test_a_file_without_screen_is_a_full_screen(self, files):
+        cfg = vs_runfile.load(write(files, MINIMAL))
+        assert cfg["screen"] == "full" and cfg["staged"] == {}
+
+    def test_screen_staged_with_its_settings(self, files):
+        cfg = vs_runfile.load(write(files, STAGED + "staged:\n  max_stereoisomers: 3\n  max_tautomers: 2\n"))
+        assert cfg["screen"] == "staged" and cfg["staged"] == {"max_stereoisomers": 3, "max_tautomers": 2}
+        assert cfg["run"]["cpus"] == 500
+
+    def test_a_staged_run_may_use_up_to_the_cluster_limit_of_cpus(self, files):
+        assert vs_runfile.load(write(files, STAGED.replace("cpus: 500", "cpus: 3000")))["run"]["cpus"] == 3000
+        assert "at most 3000" in problems_of(files, STAGED.replace("cpus: 500", "cpus: 3001"))
+
+    def test_a_full_screen_may_not(self, files):
+        assert "at most 256" in problems_of(files, MINIMAL + "  cpus: 300\n")
+
+    def test_the_staged_section_needs_screen_staged(self, files):
+        assert "only applies with 'screen: staged'" in problems_of(files, MINIMAL + "staged:\n  max_tautomers: 2\n")
+
+    @pytest.mark.parametrize("key", ["num_modes: 9", "rescore: nnscore2", "ionisation: keep"])
+    def test_docking_settings_that_a_staged_screen_does_not_use_are_refused(self, files, key):
+        assert "does not apply to the staged screen" in problems_of(files, STAGED + f"docking:\n  {key}\n")
+
+    def test_a_staged_screen_cannot_run_in_the_terminal(self, files):
+        assert "runs on the cluster" in problems_of(files, STAGED.replace("mode: save", "mode: run"))
+
+    @pytest.mark.parametrize("line", ['time: "2:00:00"', "watch: true"])
+    def test_run_settings_that_a_staged_screen_sets_itself_are_refused(self, files, line):
+        assert "does not apply to the staged screen" in problems_of(files, STAGED + f"  {line}\n")
+
+    @pytest.mark.parametrize("value", [0, 21, 1.5, "many"])
+    def test_forms_per_molecule_must_be_a_whole_number_from_1_to_20(self, files, value):
+        assert "max_stereoisomers" in problems_of(files, STAGED + f"staged:\n  max_stereoisomers: {value}\n")
+
+    def test_a_misspelt_staged_key_is_caught_with_a_hint(self, files):
+        assert "Did you mean 'max_tautomers'" in problems_of(files, STAGED + "staged:\n  max_tautomer: 2\n")
+
+    def test_screen_must_be_full_or_staged(self, files):
+        assert "must be one of: full, staged" in problems_of(files, MINIMAL.replace("run:", "screen: partial\nrun:"))
+
+    def test_the_example_file_describes_the_staged_mode(self):
+        assert "screen: staged" in vs_runfile.EXAMPLE and "max_stereoisomers" in vs_runfile.EXAMPLE
+
+    def test_render_writes_screen_only_when_it_is_staged(self):
+        base = {"ligands": "l.smi", "output": "o", "receptor": "r.pdb", "box_center": [1, 2, 3],
+                "run": {"mode": "save"}}
+        assert "\nscreen:" not in vs_runfile.render(base)
+        assert "screen: staged" in vs_runfile.render({**base, "screen": "staged", "staged": {"max_tautomers": 2}})
+
+
+class TestStagedTranche:
+    TRANCHE = STAGED + "staged:\n  strategy: tranche\n"
+
+    def test_the_tranche_settings_are_read(self, files):
+        body = self.TRANCHE + "  representatives: 4\n  primary_size: 50000\n  tranche_properties: [mw, tpsa]\n"
+        cfg = vs_runfile.load(write(files, body))
+        assert cfg["staged"] == {"strategy": "tranche", "representatives": 4, "primary_size": 50000,
+                                 "tranche_properties": ["mw", "tpsa"]}
+
+    def test_the_tranche_strategy_alone_uses_the_defaults(self, files):
+        assert vs_runfile.load(write(files, self.TRANCHE))["staged"] == {"strategy": "tranche"}
+
+    def test_strategy_all_is_the_default_and_is_accepted(self, files):
+        assert vs_runfile.load(write(files, STAGED + "staged:\n  strategy: all\n"))["staged"] == {"strategy": "all"}
+
+    @pytest.mark.parametrize("line", ["representatives: 3", "primary_size: 100", "tranche_properties: [mw]"])
+    def test_tranche_settings_need_the_tranche_strategy(self, files, line):
+        assert "only applies with 'strategy: tranche'" in problems_of(files, STAGED + f"staged:\n  {line}\n")
+
+    def test_the_strategy_must_be_known(self, files):
+        assert "must be one of: all, tranche" in problems_of(files, STAGED + "staged:\n  strategy: best\n")
+
+    @pytest.mark.parametrize("value", [0, 11, 1.5, "x"])
+    def test_representatives_are_one_to_ten(self, files, value):
+        assert "staged.representatives" in problems_of(files, self.TRANCHE + f"  representatives: {value}\n")
+
+    @pytest.mark.parametrize("value", [0, -1, 2.5, "all"])
+    def test_the_primary_size_is_a_positive_whole_number(self, files, value):
+        assert "staged.primary_size" in problems_of(files, self.TRANCHE + f"  primary_size: {value}\n")
+
+    @pytest.mark.parametrize("value", ["[mw, colour]", "[mw, mw]", "[]", "5"])
+    def test_the_tranche_properties_must_be_known_and_different(self, files, value):
+        assert "staged.tranche_properties" in problems_of(files, self.TRANCHE + f"  tranche_properties: {value}\n")
+
+    def test_the_properties_may_be_written_as_one_text(self, files):
+        cfg = vs_runfile.load(write(files, self.TRANCHE + "  tranche_properties: mw logp\n"))
+        assert cfg["staged"]["tranche_properties"] == ["mw", "logp"]
+
+    def test_the_example_file_describes_the_tranche_strategy(self):
+        assert "strategy: all" in vs_runfile.EXAMPLE and "representatives" in vs_runfile.EXAMPLE
+        assert "primary_size" in vs_runfile.EXAMPLE
+
+    def test_render_writes_the_tranche_settings_and_they_load_again(self, files):
+        values = {"ligands": "l.smi", "output": "o", "receptor": "r.pdb", "box_center": [1, 2, 3], "screen": "staged",
+                  "staged": {"strategy": "tranche", "representatives": 2, "primary_size": 10,
+                             "tranche_properties": ["mw", "hbd"]},
+                  "run": {"mode": "save", "cpus": 64}}
+        text = vs_runfile.render(values)
+        assert "strategy: tranche" in text and "representatives: 2" in text and "tranche_properties" in text
+
+
+class TestStagedFilter:
+    BASE = STAGED + "staged:\n  strategy: tranche\n"
+
+    def test_the_filter_settings_are_read(self, files):
+        cfg = vs_runfile.load(write(files, self.BASE + "  ml_filter: true\n  ml_cutoff: 0.7\n"))
+        assert cfg["staged"]["ml_filter"] is True and cfg["staged"]["ml_cutoff"] == 0.7
+
+    def test_the_filter_may_be_switched_off(self, files):
+        assert vs_runfile.load(write(files, self.BASE + "  ml_filter: false\n"))["staged"]["ml_filter"] is False
+
+    @pytest.mark.parametrize("value", ["yes please", "1", "maybe"])
+    def test_the_filter_must_be_true_or_false(self, files, value):
+        assert "staged.ml_filter" in problems_of(files, self.BASE + f"  ml_filter: {value}\n")
+
+    @pytest.mark.parametrize("value", [0.01, 0.96, 1, "high"])
+    def test_the_cutoff_must_be_between_005_and_095(self, files, value):
+        assert "staged.ml_cutoff" in problems_of(files, self.BASE + f"  ml_filter: true\n  ml_cutoff: {value}\n")
+
+    def test_a_cutoff_needs_the_filter(self, files):
+        assert "only applies with 'ml_filter: true'" in problems_of(files, self.BASE + "  ml_cutoff: 0.6\n")
+
+    @pytest.mark.parametrize("line", ["ml_filter: true", "ml_cutoff: 0.6"])
+    def test_the_filter_needs_the_tranche_strategy(self, files, line):
+        assert "only applies with 'strategy: tranche'" in problems_of(files, STAGED + f"staged:\n  {line}\n")
+
+    def test_the_example_file_describes_the_filter(self):
+        assert "ml_filter" in vs_runfile.EXAMPLE and "ml_cutoff" in vs_runfile.EXAMPLE

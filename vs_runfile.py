@@ -14,6 +14,7 @@ import re
 import yaml
 
 import vs_dock
+import vs_staged
 
 STRUCTURE_EXTENSIONS = (".pdb", ".ent", ".cif", ".mmcif")
 LIGAND_EXTENSIONS = (".sdf", ".smi", ".smiles", ".txt", ".csv")
@@ -21,7 +22,14 @@ RUN_FILE_EXTENSIONS = (".yaml", ".yml")
 
 TOP_KEYS = ("structure", "template_molecule", "chains", "keep_molecules", "receptor", "reference_ligand",
             "box_center", "ligands", "output", "existing_output", "protonation", "ph", "flagged_ligands",
-            "docking", "run")
+            "screen", "docking", "staged", "run")
+SCREEN_MODES = ("full", "staged")      # full: dock every molecule; staged: AFLP + AFVS (vs_staged.py)
+STAGED_KEYS = ("strategy", "representatives", "primary_size", "tranche_properties", "ml_filter", "ml_cutoff",
+               "max_stereoisomers", "max_tautomers")
+TRANCHE_ONLY_KEYS = ("representatives", "primary_size", "tranche_properties", "ml_filter", "ml_cutoff")
+STAGED_FORBIDDEN_DOCKING = ("num_modes", "rescore", "ionisation")
+MAX_CPUS_FULL = 256
+MAX_CPUS_STAGED = 3000                  # the cluster's limit for one user; the assistant checks the real figure
 DOCKING_KEYS = ("program", "exhaustiveness", "num_modes", "seed", "box_size", "rescore", "ionisation", "ligand_ph")
 RUN_KEYS = ("mode", "job_name", "time", "cpus", "partition", "watch")
 
@@ -209,8 +217,14 @@ def load(path):
     if data.get("flagged_ligands") is not None:
         cfg["flagged_ligands"] = _choice(data["flagged_ligands"], "flagged_ligands", ("exclude", "include"), problems)
 
-    cfg["docking"] = _read_docking(_section(data, "docking", DOCKING_KEYS, problems), problems)
+    cfg["screen"] = "full"
+    if data.get("screen") is not None:
+        cfg["screen"] = _choice(data["screen"], "screen", SCREEN_MODES, problems) or "full"
+    docking = _section(data, "docking", DOCKING_KEYS, problems)
+    cfg["docking"] = _read_docking(docking, problems)
     cfg["run"] = _read_run(_section(data, "run", RUN_KEYS, problems), problems)
+    cfg["staged"] = _read_staged(_section(data, "staged", STAGED_KEYS, problems), problems)
+    _check_screen_mode(cfg, data, docking, problems)
 
     if problems.lines:
         raise RunFileError(f"Problems in {path}:\n" + "\n".join(f"  - {line}" for line in problems.lines))
@@ -245,6 +259,63 @@ def _read_docking(section, problems):
     return out
 
 
+def _read_staged(section, problems):
+    out = {}
+    for key in ("max_stereoisomers", "max_tautomers"):
+        if key in section:
+            out[key] = _number(section[key], f"staged.{key}", problems, int, 1, 20)
+    if section.get("strategy") is not None:
+        out["strategy"] = _choice(section["strategy"], "staged.strategy", vs_staged.STRATEGIES, problems)
+    if out.get("strategy", "all") != "tranche":
+        for key in TRANCHE_ONLY_KEYS:
+            if key in section:
+                problems.add(f"staged.{key}", "only applies with 'strategy: tranche'")
+        return out
+    if "representatives" in section:
+        out["representatives"] = _number(section["representatives"], "staged.representatives", problems, int, 1,
+                                         vs_staged.MAX_REPRESENTATIVES)
+    if "primary_size" in section:
+        out["primary_size"] = _number(section["primary_size"], "staged.primary_size", problems, int, 1)
+    if section.get("ml_filter") is not None:
+        out["ml_filter"] = _flag(section["ml_filter"], "staged.ml_filter", problems)
+    if section.get("ml_cutoff") is not None:
+        out["ml_cutoff"] = _number(section["ml_cutoff"], "staged.ml_cutoff", problems, float, 0.05, 0.95)
+        if not out.get("ml_filter"):
+            problems.add("staged.ml_cutoff", "only applies with 'ml_filter: true'")
+    if section.get("tranche_properties") is not None:
+        names = _names(section["tranche_properties"], "staged.tranche_properties", problems)
+        if names is not None:
+            unknown = [n for n in names if n not in vs_staged.TRANCHE_PROPERTY_NAMES]
+            if not names or unknown or len(set(names)) != len(names):
+                problems.add("staged.tranche_properties",
+                             "must be a list of different names from: " + ", ".join(vs_staged.TRANCHE_PROPERTY_NAMES)
+                             + (f" (not understood: {', '.join(unknown)})" if unknown else ""))
+            else:
+                out["tranche_properties"] = names
+    return out
+
+
+def _check_screen_mode(cfg, data, docking, problems):
+    """Settings that only make sense in one of the two modes."""
+    run = cfg["run"]
+    if cfg["screen"] == "staged":
+        for key in STAGED_FORBIDDEN_DOCKING:
+            if key in docking:
+                problems.add(f"docking.{key}", "does not apply to the staged screen (it keeps scores, not poses, and "
+                                               "prepares the molecules itself)")
+        if run.get("mode") == "run":
+            problems.add("run.mode", "the staged screen runs on the cluster: use 'submit' or 'save'")
+        for key in ("time", "watch"):
+            if key in run:
+                problems.add(f"run.{key}", "does not apply to the staged screen (the time limit of every job is set "
+                                           "from the size of the library; follow the run with `status`)")
+    else:
+        if data.get("staged") is not None:
+            problems.add("staged", "only applies with 'screen: staged'")
+        if (run.get("cpus") or 0) > MAX_CPUS_FULL:
+            problems.add("run.cpus", f"must be at most {MAX_CPUS_FULL} (the staged screen allows more)")
+
+
 def _read_run(section, problems):
     out = {}
     if section.get("mode") is None:
@@ -270,7 +341,7 @@ def _read_run(section, problems):
             problems.add("run.time", "use hours:minutes:seconds in quotes, for example \"2:00:00\" "
                                      "(or days-hours:minutes:seconds)")
     if section.get("cpus") is not None:
-        out["cpus"] = _number(section["cpus"], "run.cpus", problems, int, 1, 256)
+        out["cpus"] = _number(section["cpus"], "run.cpus", problems, int, 1, MAX_CPUS_STAGED)
     if section.get("partition") is not None:
         out["partition"] = _text(section["partition"], "run.partition", problems)
     if "watch" in section:
@@ -311,6 +382,8 @@ def render(values, run_command="vs"):
     for key, comment in inputs:
         if values.get(key) is not None:
             lines.append(_line(key, values[key], comment))
+    if values.get("screen") and values["screen"] != "full":
+        lines.append(_line("screen", values["screen"], "full: dock every molecule | staged: AdaptiveFlow (AFLP + AFVS)"))
     lines.append(_line("ligands", values["ligands"], "molecules to dock"))
     lines.append(_line("output", values["output"], "run folder: inputs, job script, log and results/"))
     for key, comment in (("existing_output", "output folder is not empty: resume | overwrite"),
@@ -323,6 +396,14 @@ def render(values, run_command="vs"):
             "program": " | ".join(vs_dock.PROGRAMS), "exhaustiveness": "search effort per ligand",
             "num_modes": "poses kept per ligand", "seed": "random seed", "box_size": "box edge in Angstrom",
             "rescore": "nnscore2 | none", "ionisation": "ph | keep", "ligand_ph": "pH for the molecules"}),
+            ("staged", {"strategy": "all: dock every form | tranche: dock the best tranches only",
+                        "representatives": "forms docked per tranche in the prescreen (1 to 10)",
+                        "primary_size": "molecules docked in the primary screen",
+                        "tranche_properties": "properties that define the tranches",
+                        "ml_filter": "true: a neural network drops forms of the selected tranches before docking",
+                        "ml_cutoff": "forms below this predicted probability are not docked (0.05 to 0.95)",
+                        "max_stereoisomers": "stereoisomers prepared per molecule (1 = as drawn)",
+                        "max_tautomers": "tautomers prepared per molecule (1 = as drawn)"}),
             ("run", {"mode": "submit | run | save", "job_name": "", "time": "time limit, hours:minutes:seconds",
                      "cpus": "ligands docked at the same time", "partition": "", "watch": "wait for the job"})):
         section = {k: v for k, v in (values.get(name) or {}).items() if v is not None}
@@ -369,6 +450,21 @@ docking:
   # rescore: nnscore2            # re-score the poses with NNScore2 (default: none)
   # ionisation: ph               # ph: set each molecule's charge state for a pH (default) | keep: use the charges in the file
   # ligand_ph: 7.4               # the pH, with 'ionisation: ph' 
+
+# --- Staged screening with AdaptiveFlow (for libraries too big to dock whole; scores only, no poses) --------------
+# screen: staged                 # default: full (dock every molecule, keep the poses)
+# staged:
+#   strategy: all                # all: dock every form (default) | tranche: prescreen the tranches, dock only the best
+#   representatives: 3           # with 'tranche': forms docked per tranche in the prescreen (1 to 10)
+#   primary_size: 100000         # with 'tranche': molecules docked in the primary screen (default: 20% of the library)
+#   tranche_properties: [mw, logp, hba, hbd]   # with 'tranche': the properties that define the tranches (of 18, see README)
+#   ml_filter: false             # with 'tranche': train a neural network on the prescreen and dock only the forms of the
+#                                # selected tranches that it predicts to be good (primary_size is then the pool it looks at)
+#   ml_cutoff: 0.5               # with ml_filter: forms below this predicted probability are dropped
+#   max_stereoisomers: 1         # stereoisomers prepared per molecule; every form is docked, so cost grows with it
+#   max_tautomers: 1             # tautomers prepared per molecule
+# With 'screen: staged', run.mode must be submit or save, run.cpus may go up to the cluster limit (3,000), and
+# docking.num_modes, docking.rescore, docking.ionisation, run.time and run.watch are not used.
 
 # --- 5. How to run it -----------------------------------------------------------------------------------------
 run:

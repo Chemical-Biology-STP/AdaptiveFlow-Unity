@@ -1,7 +1,8 @@
 """Shared fixtures for the tests.
 
 Most tests need nothing but Python. The ones marked `slow` run the real docking programs on a small receptor and take
-about 7 minutes in all, measured at 6m37s; `pixi run test` leaves them out and `pixi run test-all` includes them.
+about 7 minutes in all, measured at 6m37s; `pixi run test` leaves them out and `pixi run test-all` includes them. The `cluster` tests submit real
+SLURM jobs; only `pixi run test-cluster` runs them.
 """
 import os
 import shutil
@@ -20,6 +21,7 @@ if REPO_DIR not in sys.path:
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "slow: runs the real docking programs (about 7 minutes in all, measured at 6m37s)")
+    config.addinivalue_line("markers", "cluster: submits real SLURM jobs and waits for them (about 2 minutes with a free queue)")
 
 
 @pytest.fixture(scope="session")

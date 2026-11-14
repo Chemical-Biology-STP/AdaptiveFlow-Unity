@@ -580,7 +580,7 @@ class TestInteractive:
 
     def test_a_cancelled_run_writes_nothing(self, inputs, answers, monkeypatch):
         monkeypatch.chdir(inputs)
-        answers(["2", "protein.pdb", "1", "ref.sdf", "", "", "", "", "mols.smi", "", "", "", "3", "", "", "", "", "", "no"])
+        answers(["1", "2", "protein.pdb", "1", "ref.sdf", "", "", "", "", "mols.smi", "", "", "", "3", "", "", "", "", "", "no"])
         vs_wizard.run_interactive()
         assert not (inputs / "vs_mols").exists()
 
@@ -619,3 +619,280 @@ class TestReport:
     def test_the_default_job_name_comes_from_the_molecule_file(self):
         assert vs_wizard.default_jobname("/data/My Library (v2).smi") == "vs_My_Library__v2_"
         assert len(vs_wizard.default_jobname("/data/" + "x" * 100 + ".smi")) == 40
+
+
+# --------------------------------------------------------------------------
+# Staged screening (AdaptiveFlow) through the assistant
+# --------------------------------------------------------------------------
+
+import vs_staged                                                                  # noqa: E402
+
+
+@pytest.fixture
+def staged_cluster(monkeypatch):
+    """The assistant asks the cluster for the CPU limit and whether sbatch exists; the tests decide both."""
+    monkeypatch.setattr(vs_staged, "cluster_cpu_limit", lambda partition="ncpu": 3000)
+    monkeypatch.setattr(vs_wizard.shutil, "which", lambda name: "/usr/bin/sbatch")
+
+
+def staged_settings_for(inputs, **extra):
+    run = {"mode": "save", "cpus": 100, **extra.pop("run", {})}
+    cfg = vs_runfile.load(run_file(inputs, screen="staged", run=run, **extra))
+    s = vs_wizard.Settings()
+    s.screen = cfg["screen"]
+    vs_wizard.run_steps(s, cfg)
+    return s
+
+
+class TestStagedAssistant:
+    def test_the_question_that_chooses_the_mode(self, answers):
+        answers([""])
+        assert vs_wizard.ask_screen_mode() == "full"
+        answers(["2"])
+        assert vs_wizard.ask_screen_mode() == "staged"
+
+    def test_a_run_file_with_screen_staged_runs_the_staged_steps(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs)
+        assert s.screen == "staged" and s.program == "qvina" and s.n_kept == 3
+        assert (s.max_stereoisomers, s.max_tautomers, s.cpus, s.mode) == (1, 1, 100, "save")
+        assert s.rundir == str(inputs / "run1")
+
+    def test_no_charge_state_question_is_asked_because_aflp_protonates(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs)
+        assert s.ionisation == "ph" and s.ligand_ph == 7.4          # the defaults, nothing asked
+
+    def test_more_forms_per_molecule_come_with_a_cost_warning(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs, staged={"max_stereoisomers": 3, "max_tautomers": 2})
+        assert (s.max_stereoisomers, s.max_tautomers) == (3, 2)
+        assert any("multiplies the docking cost" in w for w in vs_wizard.WARNINGS)
+
+    def test_the_cpu_limit_of_the_cluster_is_enforced(self, inputs, monkeypatch):
+        monkeypatch.setattr(vs_staged, "cluster_cpu_limit", lambda partition="ncpu": 1000)
+        monkeypatch.setattr(vs_wizard.shutil, "which", lambda name: "/usr/bin/sbatch")
+        with pytest.raises(vs_wizard.Stop, match="at most 1000"):
+            staged_settings_for(inputs, run={"mode": "save", "cpus": 2000})
+
+    def test_a_folder_that_already_has_files_is_refused(self, inputs, staged_cluster):
+        (inputs / "run1").mkdir()
+        (inputs / "run1" / "something").write_text("x")
+        with pytest.raises(vs_wizard.Stop, match="not empty"):
+            staged_settings_for(inputs)
+
+    def test_a_large_request_gets_a_warning(self, inputs, staged_cluster, monkeypatch):
+        monkeypatch.setattr(vs_staged, "CONFIRM_CPUS", 50)
+        staged_settings_for(inputs)
+        assert any("large request" in w for w in vs_wizard.WARNINGS)
+
+    def test_the_review_shows_what_the_run_will_cost(self, inputs, staged_cluster, capsys):
+        s = staged_settings_for(inputs)
+        vs_wizard.step_review(s, confirm=False)
+        out = capsys.readouterr().out
+        assert "staged, with AdaptiveFlow" in out and "scores only, no poses" in out
+        assert "one form per molecule" in out and "CPU-hours" in out and "Prepare the run folder" in out
+        assert "3 of 6" in out
+
+    def test_the_suggested_cpus_are_capped_at_500_and_floored_at_one_subjob(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs)
+        assert vs_wizard.suggest_staged_cpus(s, 3000) == 32                         # 3 molecules need one job
+        s.n_kept = 10 ** 8
+        assert vs_wizard.suggest_staged_cpus(s, 3000) == 500
+        assert vs_wizard.suggest_staged_cpus(s, 200) == 200                         # never above the cluster limit
+
+    def test_the_run_file_written_for_a_staged_run_loads_again(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs, staged={"max_stereoisomers": 2})
+        values = vs_wizard.run_file_values(s)
+        assert values["screen"] == "staged" and "num_modes" not in values["docking"]
+        assert values["staged"] == {"max_stereoisomers": 2, "max_tautomers": 1}
+        assert set(values["run"]) == {"mode", "job_name", "cpus", "partition"}
+        path = inputs / "again.yaml"
+        path.write_text(vs_runfile.render(values, "vs"))
+        cfg = vs_runfile.load(str(path))
+        assert cfg["screen"] == "staged" and cfg["staged"]["max_stereoisomers"] == 2 and cfg["run"]["cpus"] == 100
+
+    def test_the_plan_given_to_the_runner_has_the_settings(self, inputs, staged_cluster, monkeypatch, capsys):
+        s = staged_settings_for(inputs)
+        seen = {}
+
+        def fake_start(plan, submit=True):
+            seen["plan"], seen["submit"] = plan, submit
+            return {"counts": {"molecules": 3, "collections": 1, "unreadable": 0}}
+
+        monkeypatch.setattr(vs_staged, "start", fake_start)
+        vs_wizard.execute(s)
+        plan = seen["plan"]
+        assert seen["submit"] is False                                              # mode 'save'
+        assert (plan["program"], plan["cpus"], plan["box_size"], plan["exhaustiveness"]) == ("qvina", 100, 22.0, 16)
+        assert plan["run_dir"] == s.rundir and plan["max_stereoisomers"] == 1
+        assert os.path.basename(plan["ligands"]).startswith("molecules")           # the file without flagged molecules
+        assert "advance" in capsys.readouterr().out
+
+    def test_the_interactive_conversation(self, inputs, answers, staged_cluster, monkeypatch):
+        monkeypatch.chdir(inputs)
+        feed = answers([
+            "2", "protein.pdb",          # protein only
+            "1", "ref.sdf", "",          # a ligand in the site; accept the box
+            "2",                         # program: AutodockVina_1.2
+            "yes", "3", "2", "6.5", "20",   # change the forms: 3 stereoisomers, 2 tautomers, pH 6.5, exhaustiveness 20
+            "mols.smi", "yes",           # molecule file; leave out the flagged
+            "",                          # every form is docked (the default for a small library)
+            "2",                         # only prepare the run folder
+            "run_x", "", "",             # folder, job name, CPUs (the suggestion)
+            "no"])                       # keep the partition
+        s = vs_wizard.Settings()
+        s.screen = "staged"
+        vs_wizard.run_steps(s, None)
+        assert not feed.answers
+        assert (s.program, s.max_stereoisomers, s.max_tautomers, s.ligand_ph, s.exhaustiveness) == (
+            "AutodockVina_1.2", 3, 2, 6.5, 20)
+        assert s.mode == "save" and s.rundir == str(inputs / "run_x") and s.cpus == 32 and s.n_kept == 3
+
+
+class TestStagedTrancheAssistant:
+    TRANCHE = {"strategy": "tranche", "representatives": 2, "primary_size": 2}
+
+    def test_the_tranche_settings_come_from_the_run_file(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs, staged=self.TRANCHE)
+        assert (s.strategy, s.representatives, s.primary_size) == ("tranche", 2, 2)
+        assert s.tranche_properties == list(vs_staged.DEFAULT_TRANCHE_PROPERTIES)
+        assert s.estimate["exact"] and s.estimate["prescreen_forms"] <= s.n_kept
+
+    def test_without_a_size_the_primary_screen_is_a_fifth_of_the_library_at_least_one_molecule(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs, staged={"strategy": "tranche"})
+        assert s.primary_size == max(1, round(s.n_kept * vs_staged.DEFAULT_PRIMARY_FRACTION))
+
+    def test_a_primary_screen_bigger_than_the_library_is_cut_to_it(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs, staged={"strategy": "tranche", "primary_size": 10 ** 6})
+        assert s.primary_size == s.n_kept
+
+    def test_the_strategy_all_has_no_estimate_and_the_old_sizes(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs)
+        assert s.strategy == "all" and s.estimate is None
+        assert vs_wizard.staged_sizes(s)["dock_forms"] == vs_wizard.staged_sizes(s)["n_forms"]
+
+    def test_the_sizes_count_only_the_forms_that_are_docked(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs, staged=self.TRANCHE)
+        sizes = vs_wizard.staged_sizes(s)
+        assert sizes["primary_forms"] == 2 and sizes["dock_forms"] == min(s.n_kept, 2 + s.estimate["prescreen_forms"])
+
+    def test_the_review_names_the_strategy(self, inputs, staged_cluster, capsys):
+        s = staged_settings_for(inputs, staged=self.TRANCHE)
+        vs_wizard.step_review(s, confirm=False)
+        out = capsys.readouterr().out
+        assert "Strategy" in out and "tranches (mw, logp, hba, hbd)" in out and "2 form(s) per tranche" in out
+
+    def test_the_review_of_a_full_strategy_says_every_form_is_docked(self, inputs, staged_cluster, capsys):
+        vs_wizard.step_review(staged_settings_for(inputs), confirm=False)
+        assert "every form is docked" in capsys.readouterr().out
+
+    def test_the_strategy_comes_with_a_warning_that_it_docks_a_fraction(self, inputs, staged_cluster):
+        staged_settings_for(inputs, staged=self.TRANCHE)
+        assert any("docks a fraction" in w for w in vs_wizard.WARNINGS)
+
+    def test_the_run_file_written_for_a_tranche_run_loads_again(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs, staged={**self.TRANCHE, "tranche_properties": ["mw", "hbd"]})
+        values = vs_wizard.run_file_values(s)
+        assert values["staged"] == {"strategy": "tranche", "representatives": 2, "primary_size": 2,
+                                    "tranche_properties": ["mw", "hbd"], "max_stereoisomers": 1, "max_tautomers": 1}
+        path = inputs / "again.yaml"
+        path.write_text(vs_runfile.render(values, "vs"))
+        assert vs_runfile.load(str(path))["staged"]["tranche_properties"] == ["mw", "hbd"]
+
+    def test_the_run_file_of_a_full_strategy_has_no_tranche_keys(self, inputs, staged_cluster):
+        values = vs_wizard.run_file_values(staged_settings_for(inputs))
+        assert values["staged"] == {"max_stereoisomers": 1, "max_tautomers": 1}
+
+    def test_the_plan_given_to_the_runner_carries_the_tranche_settings(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs, staged=self.TRANCHE)
+        plan = vs_wizard.staged_plan(s)
+        assert (plan["strategy"], plan["representatives"], plan["primary_size"]) == ("tranche", 2, 2)
+        assert plan["tranche_properties"] == list(vs_staged.DEFAULT_TRANCHE_PROPERTIES)
+        full = vs_wizard.staged_plan(staged_settings_for(inputs))
+        assert full["strategy"] == "all" and "representatives" not in full
+
+    def test_the_plan_passes_the_runners_own_checks(self, inputs, staged_cluster):
+        vs_staged.check_plan(vs_wizard.staged_plan(staged_settings_for(inputs, staged=self.TRANCHE)))
+
+    def ask_strategy(self, s, answers_list, answers):
+        answers(answers_list)
+        vs_wizard.step_staged_strategy(s, None, {})
+
+    @pytest.fixture
+    def small(self, tmp_path):
+        path = tmp_path / "lib.smi"
+        path.write_text("".join(f"{x} m{i}\n" for i, x in enumerate(["CCO", "CCCO", "c1ccccc1", "CCN", "CCCN"])))
+        s = vs_wizard.Settings()
+        s.ligands, s.n_kept = str(path), 5
+        return s
+
+    def test_a_small_library_suggests_docking_every_form(self, small, answers):
+        self.ask_strategy(small, [""], answers)
+        assert small.strategy == "all"
+
+    def test_a_big_library_suggests_the_tranche_strategy(self, small, answers, monkeypatch):
+        monkeypatch.setattr(vs_wizard, "TRANCHE_SUGGESTED_FROM", 5)
+        self.ask_strategy(small, ["", "", "", "", "no", "no"], answers)
+        assert small.strategy == "tranche" and small.representatives == 3 and small.primary_size == 1
+
+    def test_the_tranche_questions_and_the_property_change(self, small, answers):
+        self.ask_strategy(small, ["2", "4", "3", "no", "yes", "mw, hbd"], answers)
+        assert (small.strategy, small.representatives, small.primary_size) == ("tranche", 4, 3)
+        assert small.tranche_properties == ["mw", "hbd"] and small.estimate["exact"]
+
+    def test_wrong_properties_are_asked_again(self, small, answers):
+        self.ask_strategy(small, ["2", "", "", "no", "yes", "mw colour", "mw"], answers)
+        assert small.tranche_properties == ["mw"]
+
+    def test_too_many_tranches_get_a_warning(self, small, answers):
+        self.ask_strategy(small, ["2", "", "", "no", "yes", "mw logp hba hbd tpsa atomcount bondcount mr"], answers)
+        assert any("almost as many tranches" in w for w in vs_wizard.WARNINGS)
+
+    def test_a_primary_size_above_the_library_is_cut(self, small, answers):
+        self.ask_strategy(small, ["2", "", "99", "no", "no"], answers)
+        assert small.primary_size == 5
+
+    def test_the_filter_is_off_unless_asked_for(self, small, answers):
+        self.ask_strategy(small, ["2", "", "", "", "no"], answers)
+        assert small.ml_filter is False
+
+    def test_the_filter_and_its_cutoff_can_be_asked_for(self, small, answers):
+        self.ask_strategy(small, ["2", "", "", "yes", "yes", "0.7", "no"], answers)
+        assert small.ml_filter is True and small.ml_cutoff == 0.7
+
+    def test_a_cutoff_outside_the_range_is_asked_again(self, small, answers):
+        self.ask_strategy(small, ["2", "", "", "yes", "yes", "0.99", "0.3", "no"], answers)
+        assert small.ml_cutoff == 0.3
+
+    def test_a_big_library_suggests_the_filter(self, small, answers, monkeypatch):
+        monkeypatch.setattr(vs_wizard, "TRANCHE_SUGGESTED_FROM", 5)
+        self.ask_strategy(small, ["2", "", "", "", "no", "no"], answers)
+        assert small.ml_filter is True and small.ml_cutoff == vs_staged.DEFAULT_ML_CUTOFF
+
+
+class TestStagedFilterAssistant:
+    FILTER = {"strategy": "tranche", "representatives": 2, "primary_size": 2, "ml_filter": True, "ml_cutoff": 0.6}
+
+    def test_the_filter_settings_come_from_the_run_file(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs, staged=self.FILTER)
+        assert s.ml_filter is True and s.ml_cutoff == 0.6
+
+    def test_the_sizes_expect_the_filter_to_cut_the_primary_screen(self, inputs, staged_cluster):
+        with_filter = vs_wizard.staged_sizes(staged_settings_for(inputs, staged=self.FILTER))
+        without = vs_wizard.staged_sizes(staged_settings_for(inputs, staged={"strategy": "tranche", "representatives": 2, "primary_size": 2}))
+        assert with_filter["ml_filter"] and with_filter["primary_forms"] < without["primary_forms"]
+
+    def test_the_review_mentions_the_filter(self, inputs, staged_cluster, capsys):
+        vs_wizard.step_review(staged_settings_for(inputs, staged=self.FILTER), confirm=False)
+        assert "neural network keeps those with a predicted probability of at least 0.6" in capsys.readouterr().out
+
+    def test_the_run_file_and_the_plan_carry_the_filter(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs, staged=self.FILTER)
+        assert vs_wizard.run_file_values(s)["staged"]["ml_filter"] is True
+        assert vs_wizard.run_file_values(s)["staged"]["ml_cutoff"] == 0.6
+        plan = vs_wizard.staged_plan(s)
+        assert plan["ml_filter"] is True and plan["ml_cutoff"] == 0.6
+        vs_staged.check_plan(plan)
+
+    def test_without_the_filter_the_keys_are_not_written(self, inputs, staged_cluster):
+        s = staged_settings_for(inputs, staged={"strategy": "tranche"})
+        assert "ml_filter" not in vs_wizard.run_file_values(s)["staged"]
+        assert vs_wizard.staged_plan(s)["ml_filter"] is False and "ml_cutoff" not in vs_wizard.staged_plan(s)

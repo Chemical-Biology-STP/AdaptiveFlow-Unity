@@ -7,6 +7,9 @@
     vs run.yaml --check   check a run file and show what would be done, without running anything
     vs config.txt         classic mode: the original VF Unity workflow from a config file (many programs)
     vs --example          print an annotated example run file
+    vs status <folder>    staged screens (AdaptiveFlow): where the run is;  vs results <folder>: the best molecules;
+    vs advance <folder>   the next step of a staged run (the pipeline calls it itself; add --retry after a failure)
+    vs redock <folder>    dock the best molecules of a finished staged run again and keep their poses
 
 Start it with `ddsuite vs` (Drug Discovery Suite) or `pixi run python vs_cli.py` (standalone).
 """
@@ -25,6 +28,7 @@ sys.path.insert(0, REPO_DIR)
 
 RUN_COMMAND = os.environ.get("DDSUITE_RUN_COMMAND") or "pixi run python vs_cli.py"
 RUN_FILE_EXTENSIONS = (".yaml", ".yml")
+STAGED_COMMANDS = ("status", "advance", "results", "redock")      # follow and continue a staged screen (vs_staged.py)
 
 
 def parse_args(argv):
@@ -34,7 +38,8 @@ def parse_args(argv):
                     f"Run it with no arguments for the interactive assistant, or give it a run file: "
                     f"`{RUN_COMMAND} run.yaml`.")
     parser.add_argument("file", nargs="?",
-                        help="a run file (.yaml) holding all the answers, or a classic config file (config.txt)")
+                        help="a run file (.yaml) holding all the answers, or a classic config file (config.txt). "
+                             f"Staged screens also have the commands: {', '.join(STAGED_COMMANDS)} <run folder>")
     parser.add_argument("--check", action="store_true",
                         help="check the file and show what would be done, without running anything")
     parser.add_argument("--example", action="store_true", help="print an annotated example run file and exit")
@@ -48,7 +53,12 @@ def parse_args(argv):
 
 
 def main(argv=None):
-    args = parse_args(sys.argv[1:] if argv is None else argv)
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in STAGED_COMMANDS:
+        import vs_staged
+
+        return vs_staged.main(argv)
+    args = parse_args(argv)
 
     if args.example:
         import vs_runfile
